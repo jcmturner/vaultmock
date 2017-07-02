@@ -3,6 +3,7 @@ package vaultmock
 import (
 	"bytes"
 	"crypto/sha256"
+	"crypto/x509"
 	"fmt"
 	"github.com/hashicorp/go-uuid"
 	vaultAPI "github.com/hashicorp/vault/api"
@@ -15,14 +16,23 @@ import (
 	"github.com/hashicorp/vault/vault"
 	log "github.com/mgutz/logxi/v1"
 	"io/ioutil"
-	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
-	"testing"
 	"sync"
+	"testing"
 )
 
-func RunMockVault(t *testing.T) (net.Listener, string, string, string) {
+func GetServer(core *vault.Core) *httptest.Server {
+	mux := http.NewServeMux()
+	mux.Handle("/", vaultHTTP.Handler(core))
+
+	s := httptest.NewTLSServer(mux)
+
+	return s
+}
+
+func RunMockVault(t *testing.T) (*httptest.Server, string, *x509.CertPool, string, string) {
 	core, err := vault.NewCore(GetMockVaultConfig())
 	if err != nil {
 		t.Fatalf("err: %s", err)
@@ -40,12 +50,23 @@ func RunMockVault(t *testing.T) (net.Listener, string, string, string) {
 	if sealed {
 		t.Fatal("should not be sealed")
 	}
-	ln, addr := vaultHTTP.TestServer(t, core)
+	s := GetServer(core)
+	addr := s.URL
 
 	// Create client to vault for configuration
 	cfg := vaultAPI.DefaultConfig()
 	cfg.Address = addr
-	c, _ := vaultAPI.NewClient(cfg)
+	certBytes := s.TLS.Certificates[0].Certificate[0]
+	cert, _ := x509.ParseCertificate(certBytes)
+	certPool := x509.NewCertPool()
+	certPool.AddCert(cert)
+	cfg.HttpClient.Transport.(*http.Transport).TLSClientConfig.ClientCAs = certPool
+	// Turn off certificate check (don't do this in production)
+	cfg.ConfigureTLS(&vaultAPI.TLSConfig{Insecure: true})
+	c, err := vaultAPI.NewClient(cfg)
+	if err != nil {
+		t.Fatalf("Error creating client in mock vault setup: %v\n", err)
+	}
 	c.SetToken(rootToken)
 
 	// Configure app-id auth
@@ -54,15 +75,24 @@ func RunMockVault(t *testing.T) (net.Listener, string, string, string) {
 		t.Fatalf("Error enabling app-id on mock vault: %v", err)
 	}
 
+	// Set policy to allow use of anything /secrets/*
+	rules := `path "secret/*" {
+  policy = "write"
+}`
+	err = c.Sys().PutPolicy("allSecrets_Test", rules)
+	if err != nil {
+		t.Fatalf("Error applying policy: %v", err)
+	}
+
 	// Generate and configure an app-id and user-id
 	test_app_id, _ := uuid.GenerateUUID()
 	test_user_id, _ := uuid.GenerateUUID()
-	req, err := http.NewRequest("POST", addr+"/v1/auth/app-id/map/app-id/"+test_app_id, bytes.NewBufferString(`{"value":"admins", "display_name":"test"}`))
+	req, err := http.NewRequest("POST", addr+"/v1/auth/app-id/map/app-id/"+test_app_id, bytes.NewBufferString(`{"value":"allSecrets_Test", "display_name":"test"}`))
 	req.Header.Set("X-Vault-Token", rootToken)
 	if err != nil {
 		t.Fatalf("Error creating http request to set up app-id for mock vault: %v", err)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := cfg.HttpClient.Do(req)
 	if err != nil {
 		t.Fatalf("Error setting up app-id for mock vault: HTTP code: %v Error: %v", resp.StatusCode, err)
 	}
@@ -76,7 +106,7 @@ func RunMockVault(t *testing.T) (net.Listener, string, string, string) {
 	if err != nil {
 		t.Fatalf("Error creating http request to map user-id to app-id for mock vault: %v", err)
 	}
-	resp, err = http.DefaultClient.Do(req)
+	resp, err = cfg.HttpClient.Do(req)
 	if err != nil {
 		t.Fatalf("Error mapping user-id to app-id for mock vault: HTTP code: %v Error: %v", resp.StatusCode, err)
 	}
@@ -86,7 +116,7 @@ func RunMockVault(t *testing.T) (net.Listener, string, string, string) {
 		t.Fatalf("Error mapping user-id to app-id for mock vault: HTTP code: %v Response: %v", resp.StatusCode, string(html))
 	}
 
-	return ln, addr, test_app_id, test_user_id
+	return s, addr, certPool, test_app_id, test_user_id
 
 }
 
