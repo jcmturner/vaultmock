@@ -12,7 +12,7 @@ import (
 	"github.com/hashicorp/vault/helper/salt"
 	vaultHTTP "github.com/hashicorp/vault/http"
 	"github.com/hashicorp/vault/logical"
-	"github.com/hashicorp/vault/physical"
+	"github.com/hashicorp/vault/physical/inmem"
 	"github.com/hashicorp/vault/vault"
 	log "github.com/mgutz/logxi/v1"
 	"io/ioutil"
@@ -122,7 +122,7 @@ func RunMockVault(t *testing.T) (*httptest.Server, string, *x509.CertPool, strin
 
 func GetMockVaultConfig() *vault.CoreConfig {
 	logger := log.NewLogger(log.NewConcurrentWriter(os.Stdout), "Mock Vault: ")
-	inm := physical.NewInmem(logger)
+	inm, _ := inmem.NewInmem(nil, logger)
 
 	noopAudits := map[string]audit.Factory{
 		"noop": func(config *audit.BackendConfig) (audit.Backend, error) {
@@ -151,6 +151,7 @@ func GetMockVaultConfig() *vault.CoreConfig {
 		CredentialBackends: map[string]logical.Factory{
 			"app-id": credAppId.Factory,
 		},
+		HAPhysical:   nil,
 		DisableMlock: true,
 		Logger:       logger,
 	}
