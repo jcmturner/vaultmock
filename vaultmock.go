@@ -32,7 +32,7 @@ func GetServer(core *vault.Core) *httptest.Server {
 	return s
 }
 
-func RunMockVault(t *testing.T) (*httptest.Server, string, *x509.CertPool, string, string) {
+func RunMockVault(t *testing.T) (*httptest.Server, string, *x509.CertPool, *x509.Certificate, string, string) {
 	core, err := vault.NewCore(GetMockVaultConfig())
 	if err != nil {
 		t.Fatalf("err: %s", err)
@@ -116,7 +116,7 @@ func RunMockVault(t *testing.T) (*httptest.Server, string, *x509.CertPool, strin
 		t.Fatalf("Error mapping user-id to app-id for mock vault: HTTP code: %v Response: %v", resp.StatusCode, string(html))
 	}
 
-	return s, addr, certPool, test_app_id, test_user_id
+	return s, addr, certPool, cert, test_app_id, test_user_id
 
 }
 
