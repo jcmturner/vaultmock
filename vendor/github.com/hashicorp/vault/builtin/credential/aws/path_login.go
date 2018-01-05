@@ -106,7 +106,8 @@ needs to be supplied along with 'identity' parameter.`,
 		},
 
 		Callbacks: map[logical.Operation]framework.OperationFunc{
-			logical.UpdateOperation: b.pathLoginUpdate,
+			logical.UpdateOperation:         b.pathLoginUpdate,
+			logical.AliasLookaheadOperation: b.pathLoginUpdate,
 		},
 
 		HelpSynopsis:    pathLoginSyn,
@@ -546,6 +547,17 @@ func (b *backend) pathLoginUpdateEc2(
 		}
 	}
 
+	// If we're just looking up for MFA, return the Alias info
+	if req.Operation == logical.AliasLookaheadOperation {
+		return &logical.Response{
+			Auth: &logical.Auth{
+				Alias: &logical.Alias{
+					Name: identityDocParsed.InstanceID,
+				},
+			},
+		}, nil
+	}
+
 	roleName := data.Get("role").(string)
 
 	// If roleName is not supplied, a role in the name of the instance's AMI ID will be looked for
@@ -631,7 +643,7 @@ func (b *backend) pathLoginUpdateEc2(
 			return logical.ErrorResponse(err.Error()), nil
 		}
 
-		// Don't let subsequent login attempts to bypass in initial
+		// Don't let subsequent login attempts to bypass the initial
 		// intent of disabling reauthentication, despite the properties
 		// of role getting updated. For example: Role has the value set
 		// to 'false', a role-tag login sets the value to 'true', then
@@ -681,7 +693,6 @@ func (b *backend) pathLoginUpdateEc2(
 
 	if roleTagResp != nil {
 		// Role tag is enabled on the role.
-		//
 
 		// Overwrite the policies with the ones returned from processing the role tag
 		// If there are no policies on the role tag, policies on the role are inherited.
@@ -759,11 +770,15 @@ func (b *backend) pathLoginUpdateEc2(
 				Renewable: true,
 				TTL:       roleEntry.TTL,
 			},
+			Alias: &logical.Alias{
+				Name: identityDocParsed.InstanceID,
+			},
 		},
 	}
 
-	// Return the nonce only if reauthentication is allowed
-	if !disallowReauthentication {
+	// Return the nonce only if reauthentication is allowed and if the nonce
+	// was not supplied by the user.
+	if !disallowReauthentication && !clientNonceSupplied {
 		// Echo the client nonce back. If nonce param was not supplied
 		// to the endpoint at all (setting it to empty string does not
 		// qualify here), callers should extract out the nonce from
@@ -771,23 +786,15 @@ func (b *backend) pathLoginUpdateEc2(
 		resp.Auth.Metadata["nonce"] = clientNonce
 	}
 
-	if roleEntry.Period > time.Duration(0) {
-		resp.Auth.TTL = roleEntry.Period
-	} else {
-		// Cap the TTL value.
-		shortestTTL := b.System().DefaultLeaseTTL()
-		if roleEntry.TTL > time.Duration(0) && roleEntry.TTL < shortestTTL {
-			shortestTTL = roleEntry.TTL
+	if roleEntry.MaxTTL > time.Duration(0) {
+		// Cap TTL to shortestMaxTTL
+		if resp.Auth.TTL > shortestMaxTTL {
+			resp.AddWarning(fmt.Sprintf("Effective TTL of '%s' exceeded the effective max_ttl of '%s'; TTL value is capped accordingly", (resp.Auth.TTL / time.Second), (shortestMaxTTL / time.Second)))
+			resp.Auth.TTL = shortestMaxTTL
 		}
-		if shortestMaxTTL < shortestTTL {
-			resp.AddWarning(fmt.Sprintf("Effective ttl of %q exceeded the effective max_ttl of %q; ttl value is capped appropriately", (shortestTTL / time.Second).String(), (shortestMaxTTL / time.Second).String()))
-			shortestTTL = shortestMaxTTL
-		}
-		resp.Auth.TTL = shortestTTL
 	}
 
 	return resp, nil
-
 }
 
 // handleRoleTagLogin is used to fetch the role tag of the instance and
@@ -928,6 +935,12 @@ func (b *backend) pathLoginRenewIam(
 		}
 	}
 
+	// Note that the error messages below can leak a little bit of information about the role information
+	// For example, if on renew, the client gets the "error parsing ARN..." error message, the client
+	// will know that it's a wildcard bind (but not the actual bind), even if the client can't actually
+	// read the role directly to know what the bind is. It's a relatively small amount of leakage, in
+	// some fairly corner cases, and in the most likely error case (role has been changed to a new ARN),
+	// the error message is identical.
 	if roleEntry.BoundIamPrincipalARN != "" {
 		// We might not get here if all bindings were on the inferred entity, which we've already validated
 		// above
@@ -936,20 +949,40 @@ func (b *backend) pathLoginRenewIam(
 			// Resolving unique IDs is enabled and the auth metadata contains the unique ID, so checking the
 			// unique ID is authoritative at this stage
 			if roleEntry.BoundIamPrincipalID != clientUserId {
-				return nil, fmt.Errorf("role no longer bound to ID %q", clientUserId)
+				return nil, fmt.Errorf("role no longer bound to ARN %q", canonicalArn)
+			}
+		} else if strings.HasSuffix(roleEntry.BoundIamPrincipalARN, "*") {
+			fullArn := b.getCachedUserId(clientUserId)
+			if fullArn == "" {
+				entity, err := parseIamArn(canonicalArn)
+				if err != nil {
+					return nil, fmt.Errorf("error parsing ARN %q: %v", canonicalArn, err)
+				}
+				fullArn, err = b.fullArn(entity, req.Storage)
+				if err != nil {
+					return nil, fmt.Errorf("error looking up full ARN of entity %v: %v", entity, err)
+				}
+				if fullArn == "" {
+					return nil, fmt.Errorf("got empty string back when looking up full ARN of entity %v", entity)
+				}
+				if clientUserId != "" {
+					b.setCachedUserId(clientUserId, fullArn)
+				}
+			}
+			if !strutil.GlobbedStringsMatch(roleEntry.BoundIamPrincipalARN, fullArn) {
+				return nil, fmt.Errorf("role no longer bound to ARN %q", canonicalArn)
 			}
 		} else if roleEntry.BoundIamPrincipalARN != canonicalArn {
-			return nil, fmt.Errorf("role no longer bound to arn %q", canonicalArn)
+			return nil, fmt.Errorf("role no longer bound to ARN %q", canonicalArn)
 		}
 	}
 
-	// If 'Period' is set on the role, then the token should never expire.
-	if roleEntry.Period > time.Duration(0) {
-		req.Auth.TTL = roleEntry.Period
-		return &logical.Response{Auth: req.Auth}, nil
-	} else {
-		return framework.LeaseExtend(roleEntry.TTL, roleEntry.MaxTTL, b.System())(req, data)
+	resp, err := framework.LeaseExtend(roleEntry.TTL, roleEntry.MaxTTL, b.System())(req, data)
+	if err != nil {
+		return nil, err
 	}
+	resp.Auth.Period = roleEntry.Period
+	return resp, nil
 }
 
 func (b *backend) pathLoginRenewEc2(
@@ -1030,24 +1063,12 @@ func (b *backend) pathLoginRenewEc2(
 		return nil, err
 	}
 
-	// If 'Period' is set on the role, then the token should never expire. Role
-	// tag does not have a 'Period' field. So, regarless of whether the token
-	// was issued using a role login or a role tag login, the period set on the
-	// role should take effect.
-	if roleEntry.Period > time.Duration(0) {
-		req.Auth.TTL = roleEntry.Period
-		return &logical.Response{Auth: req.Auth}, nil
-	} else {
-		// Cap the TTL value
-		shortestTTL := b.System().DefaultLeaseTTL()
-		if roleEntry.TTL > time.Duration(0) && roleEntry.TTL < shortestTTL {
-			shortestTTL = roleEntry.TTL
-		}
-		if shortestMaxTTL < shortestTTL {
-			shortestTTL = shortestMaxTTL
-		}
-		return framework.LeaseExtend(shortestTTL, shortestMaxTTL, b.System())(req, data)
+	resp, err := framework.LeaseExtend(roleEntry.TTL, shortestMaxTTL, b.System())(req, data)
+	if err != nil {
+		return nil, err
 	}
+	resp.Auth.Period = roleEntry.Period
+	return resp, nil
 }
 
 func (b *backend) pathLoginUpdateIam(
@@ -1127,9 +1148,21 @@ func (b *backend) pathLoginUpdateIam(
 	// This could either be a "userID:SessionID" (in the case of an assumed role) or just a "userID"
 	// (in the case of an IAM user).
 	callerUniqueId := strings.Split(callerID.UserId, ":")[0]
+
+	// If we're just looking up for MFA, return the Alias info
+	if req.Operation == logical.AliasLookaheadOperation {
+		return &logical.Response{
+			Auth: &logical.Auth{
+				Alias: &logical.Alias{
+					Name: callerUniqueId,
+				},
+			},
+		}, nil
+	}
+
 	entity, err := parseIamArn(callerID.Arn)
 	if err != nil {
-		return logical.ErrorResponse(fmt.Sprintf("Error parsing arn: %v", err)), nil
+		return logical.ErrorResponse(fmt.Sprintf("error parsing arn %q: %v", callerID.Arn, err)), nil
 	}
 
 	roleName := data.Get("role").(string)
@@ -1158,14 +1191,33 @@ func (b *backend) pathLoginUpdateIam(
 		if callerUniqueId != roleEntry.BoundIamPrincipalID {
 			return logical.ErrorResponse(fmt.Sprintf("expected IAM %s %s to resolve to unique AWS ID %q but got %q instead", entity.Type, entity.FriendlyName, roleEntry.BoundIamPrincipalID, callerUniqueId)), nil
 		}
-	} else if roleEntry.BoundIamPrincipalARN != "" && roleEntry.BoundIamPrincipalARN != entity.canonicalArn() {
-		return logical.ErrorResponse(fmt.Sprintf("IAM Principal %q does not belong to the role %q", callerID.Arn, roleName)), nil
+	} else if roleEntry.BoundIamPrincipalARN != "" {
+		if strings.HasSuffix(roleEntry.BoundIamPrincipalARN, "*") {
+			fullArn := b.getCachedUserId(callerUniqueId)
+			if fullArn == "" {
+				fullArn, err = b.fullArn(entity, req.Storage)
+				if err != nil {
+					return logical.ErrorResponse(fmt.Sprintf("error looking up full ARN of entity %v: %v", entity, err)), nil
+				}
+				if fullArn == "" {
+					return logical.ErrorResponse(fmt.Sprintf("got empty string back when looking up full ARN of entity %v", entity)), nil
+				}
+				b.setCachedUserId(callerUniqueId, fullArn)
+			}
+			if !strutil.GlobbedStringsMatch(roleEntry.BoundIamPrincipalARN, fullArn) {
+				// Note: Intentionally giving the exact same error message as a few lines below. Otherwise, we might leak information
+				// about whether the bound IAM principal ARN is a wildcard or not, and what that wildcard is.
+				return logical.ErrorResponse(fmt.Sprintf("IAM Principal %q does not belong to the role %q", callerID.Arn, roleName)), nil
+			}
+		} else if roleEntry.BoundIamPrincipalARN != entity.canonicalArn() {
+			return logical.ErrorResponse(fmt.Sprintf("IAM Principal %q does not belong to the role %q", callerID.Arn, roleName)), nil
+		}
 	}
 
 	policies := roleEntry.Policies
 
 	inferredEntityType := ""
-	inferredEntityId := ""
+	inferredEntityID := ""
 	if roleEntry.InferredEntityType == ec2EntityType {
 		instance, err := b.validateInstance(req.Storage, entity.SessionInfo, roleEntry.InferredAWSRegion, callerID.Account)
 		if err != nil {
@@ -1191,7 +1243,7 @@ func (b *backend) pathLoginUpdateIam(
 		}
 
 		inferredEntityType = ec2EntityType
-		inferredEntityId = entity.SessionInfo
+		inferredEntityID = entity.SessionInfo
 	}
 
 	resp := &logical.Response{
@@ -1204,7 +1256,7 @@ func (b *backend) pathLoginUpdateIam(
 				"client_user_id":       callerUniqueId,
 				"auth_type":            iamAuthType,
 				"inferred_entity_type": inferredEntityType,
-				"inferred_entity_id":   inferredEntityId,
+				"inferred_entity_id":   inferredEntityID,
 				"inferred_aws_region":  roleEntry.InferredAWSRegion,
 				"account_id":           entity.AccountNumber,
 			},
@@ -1216,28 +1268,24 @@ func (b *backend) pathLoginUpdateIam(
 				Renewable: true,
 				TTL:       roleEntry.TTL,
 			},
+			Alias: &logical.Alias{
+				Name: callerUniqueId,
+			},
 		},
 	}
 
-	if roleEntry.Period > time.Duration(0) {
-		resp.Auth.TTL = roleEntry.Period
-	} else {
-		shortestTTL := b.System().DefaultLeaseTTL()
-		if roleEntry.TTL > time.Duration(0) && roleEntry.TTL < shortestTTL {
-			shortestTTL = roleEntry.TTL
+	if roleEntry.MaxTTL > time.Duration(0) {
+		// Cap maxTTL to the sysview's max TTL
+		maxTTL := roleEntry.MaxTTL
+		if maxTTL > b.System().MaxLeaseTTL() {
+			maxTTL = b.System().MaxLeaseTTL()
 		}
 
-		maxTTL := b.System().MaxLeaseTTL()
-		if roleEntry.MaxTTL > time.Duration(0) && roleEntry.MaxTTL < maxTTL {
-			maxTTL = roleEntry.MaxTTL
+		// Cap TTL to MaxTTL
+		if resp.Auth.TTL > maxTTL {
+			resp.AddWarning(fmt.Sprintf("Effective TTL of '%s' exceeded the effective max_ttl of '%s'; TTL value is capped accordingly", (resp.Auth.TTL / time.Second), (maxTTL / time.Second)))
+			resp.Auth.TTL = maxTTL
 		}
-
-		if shortestTTL > maxTTL {
-			resp.AddWarning(fmt.Sprintf("Effective TTL of %q exceeded the effective max_ttl of %q; TTL value is capped accordingly", (shortestTTL / time.Second).String(), (maxTTL / time.Second).String()))
-			shortestTTL = maxTTL
-		}
-
-		resp.Auth.TTL = shortestTTL
 	}
 
 	return resp, nil
@@ -1257,11 +1305,11 @@ func hasValuesForEc2Auth(data *framework.FieldData) (bool, bool) {
 
 func hasValuesForIamAuth(data *framework.FieldData) (bool, bool) {
 	_, hasRequestMethod := data.GetOk("iam_http_request_method")
-	_, hasRequestUrl := data.GetOk("iam_request_url")
+	_, hasRequestURL := data.GetOk("iam_request_url")
 	_, hasRequestBody := data.GetOk("iam_request_body")
 	_, hasRequestHeaders := data.GetOk("iam_request_headers")
-	return (hasRequestMethod && hasRequestUrl && hasRequestBody && hasRequestHeaders),
-		(hasRequestMethod || hasRequestUrl || hasRequestBody || hasRequestHeaders)
+	return (hasRequestMethod && hasRequestURL && hasRequestBody && hasRequestHeaders),
+		(hasRequestMethod || hasRequestURL || hasRequestBody || hasRequestHeaders)
 }
 
 func parseIamArn(iamArn string) (*iamEntity, error) {
@@ -1272,6 +1320,9 @@ func parseIamArn(iamArn string) (*iamEntity, error) {
 	// most people would expect, which is arn:aws:iam::<account_id>:role/<RoleName>
 	var entity iamEntity
 	fullParts := strings.Split(iamArn, ":")
+	if len(fullParts) != 6 {
+		return nil, fmt.Errorf("unrecognized arn: contains %d colon-separated parts, expected 6", len(fullParts))
+	}
 	if fullParts[0] != "arn" {
 		return nil, fmt.Errorf("unrecognized arn: does not begin with arn:")
 	}
@@ -1284,6 +1335,9 @@ func parseIamArn(iamArn string) (*iamEntity, error) {
 	entity.AccountNumber = fullParts[4]
 	// fullParts[5] would now be something like user/<UserName> or assumed-role/<RoleName>/<RoleSessionName>
 	parts := strings.Split(fullParts[5], "/")
+	if len(parts) < 2 {
+		return nil, fmt.Errorf("unrecognized arn: %q contains fewer than 2 slash-separated parts", fullParts[5])
+	}
 	entity.Type = parts[0]
 	entity.Path = strings.Join(parts[1:len(parts)-1], "/")
 	entity.FriendlyName = parts[len(parts)-1]
@@ -1455,7 +1509,7 @@ func submitCallerIdentityRequest(method, endpoint string, parsedUrl *url.URL, bo
 		return nil, err
 	}
 	if response.StatusCode != 200 {
-		return nil, fmt.Errorf("received error code %s from STS: %s", response.StatusCode, string(responseBody))
+		return nil, fmt.Errorf("received error code %d from STS: %s", response.StatusCode, string(responseBody))
 	}
 	callerIdentityResponse, err := parseGetCallerIdentityResponse(string(responseBody))
 	if err != nil {
@@ -1508,6 +1562,7 @@ type iamEntity struct {
 	SessionInfo   string
 }
 
+// Returns a Vault-internal canonical ARN for referring to an IAM entity
 func (e *iamEntity) canonicalArn() string {
 	entityType := e.Type
 	// canonicalize "assumed-role" into "role"
@@ -1520,6 +1575,46 @@ func (e *iamEntity) canonicalArn() string {
 	// code and test, and it also breaks backwards compatibility in an area where we would really want
 	// it
 	return fmt.Sprintf("arn:%s:iam::%s:%s/%s", e.Partition, e.AccountNumber, entityType, e.FriendlyName)
+}
+
+// This returns the "full" ARN of an iamEntity, how it would be referred to in AWS proper
+func (b *backend) fullArn(e *iamEntity, s logical.Storage) (string, error) {
+	// Not assuming path is reliable for any entity types
+	client, err := b.clientIAM(s, getAnyRegionForAwsPartition(e.Partition).ID(), e.AccountNumber)
+	if err != nil {
+		return "", fmt.Errorf("error creating IAM client: %v", err)
+	}
+
+	switch e.Type {
+	case "user":
+		input := iam.GetUserInput{
+			UserName: aws.String(e.FriendlyName),
+		}
+		resp, err := client.GetUser(&input)
+		if err != nil {
+			return "", fmt.Errorf("error fetching user %q: %v", e.FriendlyName, err)
+		}
+		if resp == nil {
+			return "", fmt.Errorf("nil response from GetUser")
+		}
+		return *(resp.User.Arn), nil
+	case "assumed-role":
+		fallthrough
+	case "role":
+		input := iam.GetRoleInput{
+			RoleName: aws.String(e.FriendlyName),
+		}
+		resp, err := client.GetRole(&input)
+		if err != nil {
+			return "", fmt.Errorf("error fetching role %q: %v", e.FriendlyName, err)
+		}
+		if resp == nil {
+			return "", fmt.Errorf("nil response form GetRole")
+		}
+		return *(resp.Role.Arn), nil
+	default:
+		return "", fmt.Errorf("unrecognized entity type: %s", e.Type)
+	}
 }
 
 const iamServerIdHeader = "X-Vault-AWS-IAM-Server-ID"

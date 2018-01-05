@@ -1,6 +1,7 @@
 package cockroachdb
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"sort"
@@ -195,7 +196,7 @@ func (c *CockroachDBBackend) List(prefix string) ([]string, error) {
 }
 
 // Transaction is used to run multiple entries via a transaction
-func (c *CockroachDBBackend) Transaction(txns []physical.TxnEntry) error {
+func (c *CockroachDBBackend) Transaction(txns []*physical.TxnEntry) error {
 	defer metrics.MeasureSince([]string{"cockroachdb", "transaction"}, time.Now())
 	if len(txns) == 0 {
 		return nil
@@ -204,12 +205,12 @@ func (c *CockroachDBBackend) Transaction(txns []physical.TxnEntry) error {
 	c.permitPool.Acquire()
 	defer c.permitPool.Release()
 
-	return crdb.ExecuteTx(c.client, func(tx *sql.Tx) error {
+	return crdb.ExecuteTx(context.Background(), c.client, nil, func(tx *sql.Tx) error {
 		return c.transaction(tx, txns)
 	})
 }
 
-func (c *CockroachDBBackend) transaction(tx *sql.Tx, txns []physical.TxnEntry) error {
+func (c *CockroachDBBackend) transaction(tx *sql.Tx, txns []*physical.TxnEntry) error {
 	deleteStmt, err := tx.Prepare(c.rawStatements["delete"])
 	if err != nil {
 		return err

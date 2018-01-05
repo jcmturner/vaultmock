@@ -2,6 +2,7 @@ package pki
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/rsa"
@@ -9,6 +10,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"encoding/base64"
 	"encoding/pem"
 	"fmt"
 	"net"
@@ -16,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hashicorp/errwrap"
 	"github.com/hashicorp/vault/helper/certutil"
 	"github.com/hashicorp/vault/helper/errutil"
 	"github.com/hashicorp/vault/helper/parseutil"
@@ -372,9 +375,9 @@ func validateNames(req *logical.Request, names []string, role *roleEntry) string
 			}
 		}
 
-		if role.AllowedDomains != "" {
+		if len(role.AllowedDomains) > 0 {
 			valid := false
-			for _, currDomain := range strings.Split(role.AllowedDomains, ",") {
+			for _, currDomain := range role.AllowedDomains {
 				// If there is, say, a trailing comma, ignore it
 				if currDomain == "" {
 					continue
@@ -727,49 +730,39 @@ func generateCreationBundle(b *backend,
 		}
 	}
 
-	// Get the TTL and very it against the max allowed
-	var ttlField string
+	// Get the TTL and verify it against the max allowed
 	var ttl time.Duration
 	var maxTTL time.Duration
 	var notAfter time.Time
-	var ttlFieldInt interface{}
 	{
-		ttlFieldInt, ok = data.GetOk("ttl")
-		if !ok {
-			ttlField = role.TTL
-		} else {
-			ttlField = ttlFieldInt.(string)
-		}
+		ttl = time.Duration(data.Get("ttl").(int)) * time.Second
 
-		if len(ttlField) == 0 {
-			ttl = b.System().DefaultLeaseTTL()
-		} else {
-			ttl, err = parseutil.ParseDurationSecond(ttlField)
-			if err != nil {
-				return nil, errutil.UserError{Err: fmt.Sprintf(
-					"invalid requested ttl: %s", err)}
+		if ttl == 0 {
+			if role.TTL != "" {
+				ttl, err = parseutil.ParseDurationSecond(role.TTL)
+				if err != nil {
+					return nil, errutil.UserError{Err: fmt.Sprintf(
+						"invalid role ttl: %s", err)}
+				}
 			}
 		}
 
-		if len(role.MaxTTL) == 0 {
-			maxTTL = b.System().MaxLeaseTTL()
-		} else {
+		if role.MaxTTL != "" {
 			maxTTL, err = parseutil.ParseDurationSecond(role.MaxTTL)
 			if err != nil {
 				return nil, errutil.UserError{Err: fmt.Sprintf(
-					"invalid ttl: %s", err)}
+					"invalid role max_ttl: %s", err)}
 			}
 		}
 
+		if ttl == 0 {
+			ttl = b.System().DefaultLeaseTTL()
+		}
+		if maxTTL == 0 {
+			maxTTL = b.System().MaxLeaseTTL()
+		}
 		if ttl > maxTTL {
-			// Don't error if they were using system defaults, only error if
-			// they specifically chose a bad TTL
-			if len(ttlField) == 0 {
-				ttl = maxTTL
-			} else {
-				return nil, errutil.UserError{Err: fmt.Sprintf(
-					"ttl is larger than maximum allowed (%d)", maxTTL/time.Second)}
-			}
+			ttl = maxTTL
 		}
 
 		notAfter = time.Now().Add(ttl)
@@ -777,7 +770,7 @@ func generateCreationBundle(b *backend,
 		// If it's not self-signed, verify that the issued certificate won't be
 		// valid past the lifetime of the CA certificate
 		if signingBundle != nil &&
-			notAfter.After(signingBundle.Certificate.NotAfter) {
+			notAfter.After(signingBundle.Certificate.NotAfter) && !role.AllowExpirationPastCA {
 
 			return nil, errutil.UserError{Err: fmt.Sprintf(
 				"cannot satisfy request, as TTL is beyond the expiration of the CA certificate")}
@@ -939,6 +932,7 @@ func createCertificate(creationInfo *creationBundle) (*certutil.ParsedCertBundle
 		}
 
 		caCert := creationInfo.SigningBundle.Certificate
+		certTemplate.AuthorityKeyId = caCert.SubjectKeyId
 
 		err = checkPermittedDNSDomains(certTemplate, caCert)
 		if err != nil {
@@ -962,6 +956,7 @@ func createCertificate(creationInfo *creationBundle) (*certutil.ParsedCertBundle
 			certTemplate.SignatureAlgorithm = x509.ECDSAWithSHA256
 		}
 
+		certTemplate.AuthorityKeyId = subjKeyID
 		certTemplate.BasicConstraintsValid = true
 		certBytes, err = x509.CreateCertificate(rand.Reader, certTemplate, certTemplate, result.PrivateKey.Public(), result.PrivateKey)
 	}
@@ -1069,6 +1064,8 @@ func signCertificate(creationInfo *creationBundle,
 	}
 	subjKeyID := sha1.Sum(marshaledKey)
 
+	caCert := creationInfo.SigningBundle.Certificate
+
 	subject := pkix.Name{
 		CommonName:         creationInfo.CommonName,
 		OrganizationalUnit: creationInfo.OU,
@@ -1076,11 +1073,12 @@ func signCertificate(creationInfo *creationBundle,
 	}
 
 	certTemplate := &x509.Certificate{
-		SerialNumber: serialNumber,
-		Subject:      subject,
-		NotBefore:    time.Now().Add(-30 * time.Second),
-		NotAfter:     creationInfo.NotAfter,
-		SubjectKeyId: subjKeyID[:],
+		SerialNumber:   serialNumber,
+		Subject:        subject,
+		NotBefore:      time.Now().Add(-30 * time.Second),
+		NotAfter:       creationInfo.NotAfter,
+		SubjectKeyId:   subjKeyID[:],
+		AuthorityKeyId: caCert.SubjectKeyId,
 	}
 
 	switch creationInfo.SigningBundle.PrivateKeyType {
@@ -1107,7 +1105,6 @@ func signCertificate(creationInfo *creationBundle,
 	addKeyUsages(creationInfo, certTemplate)
 
 	var certBytes []byte
-	caCert := creationInfo.SigningBundle.Certificate
 
 	certTemplate.IssuingCertificateURL = creationInfo.URLs.IssuingCertificates
 	certTemplate.CRLDistributionPoints = creationInfo.URLs.CRLDistributionPoints
@@ -1188,4 +1185,67 @@ NameCheck:
 	}
 
 	return fmt.Errorf("name %q disallowed by CA's permitted DNS domains", badName)
+}
+
+func convertRespToPKCS8(resp *logical.Response) error {
+	privRaw, ok := resp.Data["private_key"]
+	if !ok {
+		return nil
+	}
+	priv, ok := privRaw.(string)
+	if !ok {
+		return fmt.Errorf("error converting response to pkcs8: could not parse original value as string")
+	}
+
+	privKeyTypeRaw, ok := resp.Data["private_key_type"]
+	if !ok {
+		return fmt.Errorf("error converting response to pkcs8: %q not found in response", "private_key_type")
+	}
+	privKeyType, ok := privKeyTypeRaw.(certutil.PrivateKeyType)
+	if !ok {
+		return fmt.Errorf("error converting response to pkcs8: could not parse original type value as string")
+	}
+
+	var keyData []byte
+	var pemUsed bool
+	var err error
+	var signer crypto.Signer
+
+	block, _ := pem.Decode([]byte(priv))
+	if block == nil {
+		keyData, err = base64.StdEncoding.DecodeString(priv)
+		if err != nil {
+			return errwrap.Wrapf("error converting response to pkcs8: error decoding original value: {{err}}", err)
+		}
+	} else {
+		keyData = block.Bytes
+		pemUsed = true
+	}
+
+	switch privKeyType {
+	case certutil.RSAPrivateKey:
+		signer, err = x509.ParsePKCS1PrivateKey(keyData)
+	case certutil.ECPrivateKey:
+		signer, err = x509.ParseECPrivateKey(keyData)
+	default:
+		return fmt.Errorf("unknown private key type %q", privKeyType)
+	}
+	if err != nil {
+		return errwrap.Wrapf("error converting response to pkcs8: error parsing previous key: {{err}}", err)
+	}
+
+	keyData, err = certutil.MarshalPKCS8PrivateKey(signer)
+	if err != nil {
+		return errwrap.Wrapf("error converting response to pkcs8: error marshaling pkcs8 key: {{err}}", err)
+	}
+
+	if pemUsed {
+		block.Type = "PRIVATE KEY"
+		block.Bytes = keyData
+		resp.Data["private_key"] = string(pem.EncodeToMemory(block))
+	} else {
+		resp.Data["private_key"] = base64.StdEncoding.EncodeToString(keyData)
+	}
+
+	return nil
 }

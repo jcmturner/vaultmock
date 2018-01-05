@@ -10,6 +10,7 @@ import (
 	"github.com/hashicorp/vault/version"
 
 	credGcp "github.com/hashicorp/vault-plugin-auth-gcp/plugin"
+	credKube "github.com/hashicorp/vault-plugin-auth-kubernetes"
 	credAppId "github.com/hashicorp/vault/builtin/credential/app-id"
 	credAppRole "github.com/hashicorp/vault/builtin/credential/approle"
 	credAws "github.com/hashicorp/vault/builtin/credential/aws"
@@ -44,6 +45,7 @@ import (
 	"github.com/hashicorp/vault/builtin/logical/mongodb"
 	"github.com/hashicorp/vault/builtin/logical/mssql"
 	"github.com/hashicorp/vault/builtin/logical/mysql"
+	"github.com/hashicorp/vault/builtin/logical/nomad"
 	"github.com/hashicorp/vault/builtin/logical/pki"
 	"github.com/hashicorp/vault/builtin/logical/postgresql"
 	"github.com/hashicorp/vault/builtin/logical/rabbitmq"
@@ -90,21 +92,23 @@ func Commands(metaPtr *meta.Meta) map[string]cli.CommandFactory {
 					"socket": auditSocket.Factory,
 				},
 				CredentialBackends: map[string]logical.Factory{
-					"approle":  credAppRole.Factory,
-					"cert":     credCert.Factory,
-					"aws":      credAws.Factory,
-					"app-id":   credAppId.Factory,
-					"gcp":      credGcp.Factory,
-					"github":   credGitHub.Factory,
-					"userpass": credUserpass.Factory,
-					"ldap":     credLdap.Factory,
-					"okta":     credOkta.Factory,
-					"radius":   credRadius.Factory,
-					"plugin":   plugin.Factory,
+					"approle":    credAppRole.Factory,
+					"cert":       credCert.Factory,
+					"aws":        credAws.Factory,
+					"app-id":     credAppId.Factory,
+					"gcp":        credGcp.Factory,
+					"github":     credGitHub.Factory,
+					"userpass":   credUserpass.Factory,
+					"ldap":       credLdap.Factory,
+					"okta":       credOkta.Factory,
+					"radius":     credRadius.Factory,
+					"kubernetes": credKube.Factory,
+					"plugin":     plugin.Factory,
 				},
 				LogicalBackends: map[string]logical.Factory{
 					"aws":        aws.Factory,
 					"consul":     consul.Factory,
+					"nomad":      nomad.Factory,
 					"postgresql": postgresql.Factory,
 					"cassandra":  cassandra.Factory,
 					"pki":        pki.Factory,

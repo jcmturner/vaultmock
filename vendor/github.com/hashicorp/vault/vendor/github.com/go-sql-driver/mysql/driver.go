@@ -64,7 +64,6 @@ func (d MySQLDriver) Open(dsn string) (driver.Conn, error) {
 		return nil, err
 	}
 	mc.parseTime = mc.cfg.ParseTime
-	mc.strict = mc.cfg.Strict
 
 	// Connect to Server
 	if dial, ok := dials[mc.cfg.Net]; ok {
@@ -189,17 +188,6 @@ func handleAuthResult(mc *mysqlConn, oldCipher []byte) error {
 	return err
 }
 
-// jcmturner - updated out to prevent panic clashes
 func init() {
-	dn := "mysql"
-	var r bool
-	for _, d := range sql.Drivers() {
-		if d == dn {
-			r = true
-			break
-		}
-	}
-	if !r {
-		sql.Register(dn, &MySQLDriver{})
-	}
+	sql.Register("mysql", &MySQLDriver{})
 }

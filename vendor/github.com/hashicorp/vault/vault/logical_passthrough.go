@@ -7,6 +7,7 @@ import (
 
 	"github.com/hashicorp/vault/helper/jsonutil"
 	"github.com/hashicorp/vault/helper/parseutil"
+	"github.com/hashicorp/vault/helper/wrapping"
 	"github.com/hashicorp/vault/logical"
 	"github.com/hashicorp/vault/logical/framework"
 )
@@ -31,6 +32,12 @@ func LeaseSwitchedPassthroughBackend(conf *logical.BackendConfig, leases bool) (
 	b.Backend = &framework.Backend{
 		Help: strings.TrimSpace(passthroughHelp),
 
+		PathsSpecial: &logical.Paths{
+			SealWrapStorage: []string{
+				"/",
+			},
+		},
+
 		Paths: []*framework.Path{
 			&framework.Path{
 				Pattern: ".*",
@@ -53,7 +60,7 @@ func LeaseSwitchedPassthroughBackend(conf *logical.BackendConfig, leases bool) (
 
 	b.Backend.Secrets = []*framework.Secret{
 		&framework.Secret{
-			Type: "generic",
+			Type: "kv",
 
 			Renew:  b.handleRead,
 			Revoke: b.handleRevoke,
@@ -116,13 +123,22 @@ func (b *PassthroughBackend) handleRead(
 	var resp *logical.Response
 	if b.generateLeases {
 		// Generate the response
-		resp = b.Secret("generic").Response(rawData, nil)
+		resp = b.Secret("kv").Response(rawData, nil)
 		resp.Secret.Renewable = false
 	} else {
 		resp = &logical.Response{
 			Secret: &logical.Secret{},
 			Data:   rawData,
 		}
+	}
+
+	// Ensure seal wrapping is carried through if the response is
+	// response-wrapped
+	if out.SealWrap {
+		if resp.WrapInfo == nil {
+			resp.WrapInfo = &wrapping.ResponseWrapInfo{}
+		}
+		resp.WrapInfo.SealWrap = out.SealWrap
 	}
 
 	// Check if there is a ttl key
@@ -207,7 +223,7 @@ func (b *PassthroughBackend) handleList(
 }
 
 const passthroughHelp = `
-The generic backend reads and writes arbitrary secrets to the backend.
+The kv backend reads and writes arbitrary secrets to the backend.
 The secrets are encrypted/decrypted by Vault: they are never stored
 unencrypted in the backend and the backend never has an opportunity to
 see the unencrypted value.

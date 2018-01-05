@@ -34,6 +34,11 @@ func GenerateLoginData(accessKey, secretKey, sessionToken, headerValue string) (
 		return nil, fmt.Errorf("could not compile valid credential providers from static config, environment, shared, or instance metadata")
 	}
 
+	_, err = creds.Get()
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve credentials from credential chain: %v", err)
+	}
+
 	// Use the credentials we've found to construct an STS session
 	stsSession, err := session.NewSessionWithOptions(session.Options{
 		Config: aws.Config{Credentials: creds},
@@ -69,7 +74,7 @@ func GenerateLoginData(accessKey, secretKey, sessionToken, headerValue string) (
 	return loginData, nil
 }
 
-func (h *CLIHandler) Auth(c *api.Client, m map[string]string) (string, error) {
+func (h *CLIHandler) Auth(c *api.Client, m map[string]string) (*api.Secret, error) {
 	mount, ok := m["mount"]
 	if !ok {
 		mount = "aws"
@@ -87,23 +92,23 @@ func (h *CLIHandler) Auth(c *api.Client, m map[string]string) (string, error) {
 
 	loginData, err := GenerateLoginData(m["aws_access_key_id"], m["aws_secret_access_key"], m["aws_security_token"], headerValue)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if loginData == nil {
-		return "", fmt.Errorf("got nil response from GenerateLoginData")
+		return nil, fmt.Errorf("got nil response from GenerateLoginData")
 	}
 	loginData["role"] = role
 	path := fmt.Sprintf("auth/%s/login", mount)
 	secret, err := c.Logical().Write(path, loginData)
 
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if secret == nil {
-		return "", fmt.Errorf("empty response from credential provider")
+		return nil, fmt.Errorf("empty response from credential provider")
 	}
 
-	return secret.Auth.ClientToken, nil
+	return secret, nil
 }
 
 func (h *CLIHandler) Help() string {

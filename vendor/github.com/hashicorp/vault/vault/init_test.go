@@ -15,11 +15,9 @@ func TestCore_Init(t *testing.T) {
 	c, conf := testCore_NewTestCore(t, nil)
 	testCore_Init_Common(t, c, conf, &SealConfig{SecretShares: 5, SecretThreshold: 3}, nil)
 
-	c, conf = testCore_NewTestCore(t, newTestSeal(t))
-	bc, rc := TestSealDefConfigs()
-	rc.SecretShares = 4
-	rc.SecretThreshold = 2
-	testCore_Init_Common(t, c, conf, bc, rc)
+	c, conf = testCore_NewTestCore(t, NewTestSeal(t, nil))
+	bc, _ := TestSealDefConfigs()
+	testCore_Init_Common(t, c, conf, bc, nil)
 }
 
 func testCore_NewTestCore(t *testing.T, seal Seal) (*Core, *CoreConfig) {
@@ -33,7 +31,7 @@ func testCore_NewTestCore(t *testing.T, seal Seal) (*Core, *CoreConfig) {
 		Physical:     inm,
 		DisableMlock: true,
 		LogicalBackends: map[string]logical.Factory{
-			"generic": LeasedPassthroughBackendFactory,
+			"kv": LeasedPassthroughBackendFactory,
 		},
 		Seal: seal,
 	}

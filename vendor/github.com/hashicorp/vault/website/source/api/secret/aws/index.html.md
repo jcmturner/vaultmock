@@ -52,6 +52,10 @@ valid AWS credentials with proper permissions.
   will use the `AWS_REGION` env var, `AWS_DEFAULT_REGION` env var, or
   `us-east-1` in that order.
 
+- `iam_endpoint` `(string: <optional>)` – Specifies a custom HTTP IAM endpoint to use.
+
+- `sts_endpoint` `(string: <optional>)` – Specifies a custom HTTP STS endpoint to use.
+
 ### Sample Payload
 
 ```json
@@ -236,6 +240,7 @@ This endpoint lists all existing roles in the backend.
 | Method   | Path                         | Produces               |
 | :------- | :--------------------------- | :--------------------- |
 | `LIST`   | `/aws/roles`                 | `200 application/json` |
+| `GET`    | `/aws/roles?list=true`       | `200 application/json` |
 
 ### Sample Request
 
@@ -265,7 +270,7 @@ exist, a 404 is returned.
 
 | Method   | Path                         | Produces               |
 | :------- | :--------------------------- | :--------------------- |
-| `DELET`  | `/aws/roles/:name`           | `204 (empty body)`     |
+| `DELETE`  | `/aws/roles/:name`           | `204 (empty body)`     |
 
 ### Parameters
 
@@ -293,7 +298,7 @@ role must be created before queried.
 ### Parameters
 
 - `name` `(string: <required>)` – Specifies the name of the role to generate
-  credentials againts. This is part of the request URL.
+  credentials against. This is part of the request URL.
 
 ### Sample Request
 

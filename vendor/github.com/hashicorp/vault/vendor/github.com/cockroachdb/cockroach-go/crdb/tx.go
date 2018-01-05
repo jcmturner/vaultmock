@@ -11,24 +11,17 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrei Matei (andrei@cockroachlabs.com)
 
 // Package crdb provides helpers for using CockroachDB in client
 // applications.
 package crdb
 
 import (
+	"context"
 	"database/sql"
 
 	"github.com/lib/pq"
 )
-
-// AmbiguousCommitError represents an error that left a transaction in an
-// ambiguous state: unclear if it committed or not.
-type AmbiguousCommitError struct {
-	error
-}
 
 // ExecuteTx runs fn inside a transaction and retries it as needed.
 // On non-retryable failures, the transaction is aborted and rolled
@@ -37,24 +30,26 @@ type AmbiguousCommitError struct {
 // we err on RELEASE with a communication error it's unclear if the transaction
 // has been committed or not (similar to erroring on COMMIT in other databases).
 // In that case, we return AmbiguousCommitError.
+// There are cases when restarting a transaction fails: we err on ROLLBACK
+// to the SAVEPOINT. In that case, we return a TxnRestartError.
 //
 // For more information about CockroachDB's transaction model see
-// https://cockroachlabs.com/docs/transactions.html.
+// https://cockroachlabs.com/docs/stable/transactions.html.
 //
-// NOTE: the supplied exec closure should not have external side
+// NOTE: the supplied fn closure should not have external side
 // effects beyond changes to the database.
-func ExecuteTx(db *sql.DB, fn func(*sql.Tx) error) (err error) {
+func ExecuteTx(ctx context.Context, db *sql.DB, txopts *sql.TxOptions, fn func(*sql.Tx) error) error {
 	// Start a transaction.
-	var tx *sql.Tx
-	tx, err = db.Begin()
+	tx, err := db.BeginTx(ctx, txopts)
 	if err != nil {
 		return err
 	}
-	return ExecuteInTx(tx, func() error { return fn(tx) })
+	return ExecuteInTx(ctx, tx, func() error { return fn(tx) })
 }
 
+// Tx is used to permit clients to implement custom transaction logic.
 type Tx interface {
-	Exec(query string, args ...interface{}) (sql.Result, error)
+	ExecContext(context.Context, string, ...interface{}) (sql.Result, error)
 	Commit() error
 	Rollback() error
 }
@@ -64,7 +59,7 @@ type Tx interface {
 // ExecuteInTx will only retry statements that are performed within the supplied
 // closure (fn). Any statements performed on the tx before ExecuteInTx is invoked will *not*
 // be re-run if the transaction needs to be retried.
-func ExecuteInTx(tx Tx, fn func() error) (err error) {
+func ExecuteInTx(ctx context.Context, tx Tx, fn func() error) (err error) {
 	defer func() {
 		if err == nil {
 			// Ignore commit errors. The tx has already been committed by RELEASE.
@@ -77,7 +72,7 @@ func ExecuteInTx(tx Tx, fn func() error) (err error) {
 	}()
 	// Specify that we intend to retry this txn in case of CockroachDB retryable
 	// errors.
-	if _, err = tx.Exec("SAVEPOINT cockroach_restart"); err != nil {
+	if _, err = tx.ExecContext(ctx, "SAVEPOINT cockroach_restart"); err != nil {
 		return err
 	}
 
@@ -88,7 +83,7 @@ func ExecuteInTx(tx Tx, fn func() error) (err error) {
 			// RELEASE acts like COMMIT in CockroachDB. We use it since it gives us an
 			// opportunity to react to retryable errors, whereas tx.Commit() doesn't.
 			released = true
-			if _, err = tx.Exec("RELEASE SAVEPOINT cockroach_restart"); err == nil {
+			if _, err = tx.ExecContext(ctx, "RELEASE SAVEPOINT cockroach_restart"); err == nil {
 				return nil
 			}
 		}
@@ -99,12 +94,12 @@ func ExecuteInTx(tx Tx, fn func() error) (err error) {
 		pqErr, ok := err.(*pq.Error)
 		if retryable := ok && (pqErr.Code == "CR000" || pqErr.Code == "40001"); !retryable {
 			if released {
-				err = &AmbiguousCommitError{err}
+				err = newAmbiguousCommitError(err)
 			}
 			return err
 		}
-		if _, err = tx.Exec("ROLLBACK TO SAVEPOINT cockroach_restart"); err != nil {
-			return err
+		if _, retryErr := tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT cockroach_restart"); retryErr != nil {
+			return newTxnRestartError(retryErr, err)
 		}
 	}
 }

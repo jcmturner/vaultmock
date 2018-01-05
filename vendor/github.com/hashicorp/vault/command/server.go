@@ -18,11 +18,10 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/net/http2"
-
 	colorable "github.com/mattn/go-colorable"
 	log "github.com/mgutz/logxi/v1"
 	testing "github.com/mitchellh/go-testing-interface"
+	"github.com/posener/complete"
 
 	"google.golang.org/grpc/grpclog"
 
@@ -30,15 +29,16 @@ import (
 	"github.com/armon/go-metrics/circonus"
 	"github.com/armon/go-metrics/datadog"
 	"github.com/hashicorp/errwrap"
+	hclog "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/vault/audit"
 	"github.com/hashicorp/vault/command/server"
 	"github.com/hashicorp/vault/helper/flag-slice"
 	"github.com/hashicorp/vault/helper/gated-writer"
+	"github.com/hashicorp/vault/helper/logbridge"
 	"github.com/hashicorp/vault/helper/logformat"
 	"github.com/hashicorp/vault/helper/mlock"
 	"github.com/hashicorp/vault/helper/parseutil"
-	"github.com/hashicorp/vault/helper/proxyutil"
 	"github.com/hashicorp/vault/helper/reload"
 	vaulthttp "github.com/hashicorp/vault/http"
 	"github.com/hashicorp/vault/logical"
@@ -72,20 +72,24 @@ type ServerCommand struct {
 }
 
 func (c *ServerCommand) Run(args []string) int {
-	var dev, verifyOnly, devHA, devTransactional, devLeasedGeneric, devThreeNode bool
+	var dev, verifyOnly, devHA, devTransactional, devLeasedKV, devThreeNode, devSkipInit bool
 	var configPath []string
-	var logLevel, devRootTokenID, devListenAddress, devPluginDir string
+	var logLevelFlag, devRootTokenID, devListenAddress, devPluginDir string
+	var devLatency, devLatencyJitter int
 	flags := c.Meta.FlagSet("server", meta.FlagSetDefault)
 	flags.BoolVar(&dev, "dev", false, "")
 	flags.StringVar(&devRootTokenID, "dev-root-token-id", "", "")
 	flags.StringVar(&devListenAddress, "dev-listen-address", "", "")
 	flags.StringVar(&devPluginDir, "dev-plugin-dir", "", "")
-	flags.StringVar(&logLevel, "log-level", "info", "")
+	flags.StringVar(&logLevelFlag, "log-level", "", "")
+	flags.IntVar(&devLatency, "dev-latency", 0, "")
+	flags.IntVar(&devLatencyJitter, "dev-latency-jitter", 20, "")
 	flags.BoolVar(&verifyOnly, "verify-only", false, "")
 	flags.BoolVar(&devHA, "dev-ha", false, "")
 	flags.BoolVar(&devTransactional, "dev-transactional", false, "")
-	flags.BoolVar(&devLeasedGeneric, "dev-leased-generic", false, "")
+	flags.BoolVar(&devLeasedKV, "dev-leased-kv", false, "")
 	flags.BoolVar(&devThreeNode, "dev-three-node", false, "")
+	flags.BoolVar(&devSkipInit, "dev-skip-init", false, "")
 	flags.Usage = func() { c.Ui.Output(c.Help()) }
 	flags.Var((*sliceflag.StringFlag)(&configPath), "config", "config")
 	if err := flags.Parse(args); err != nil {
@@ -96,19 +100,25 @@ func (c *ServerCommand) Run(args []string) int {
 	// start logging too early.
 	c.logGate = &gatedwriter.Writer{Writer: colorable.NewColorable(os.Stderr)}
 	var level int
-	logLevel = strings.ToLower(strings.TrimSpace(logLevel))
+	var logLevel string
+	if os.Getenv("VAULT_LOG_LEVEL") != "" {
+		logLevel = os.Getenv("VAULT_LOG_LEVEL")
+	}
+	if logLevelFlag != "" {
+		logLevel = strings.ToLower(strings.TrimSpace(logLevelFlag))
+	}
 	switch logLevel {
 	case "trace":
 		level = log.LevelTrace
 	case "debug":
 		level = log.LevelDebug
-	case "info":
+	case "info", "":
 		level = log.LevelInfo
 	case "notice":
 		level = log.LevelNotice
-	case "warn":
+	case "warn", "warning":
 		level = log.LevelWarn
-	case "err":
+	case "err", "error":
 		level = log.LevelError
 	default:
 		c.Ui.Output(fmt.Sprintf("Unknown log level %s", logLevel))
@@ -121,13 +131,21 @@ func (c *ServerCommand) Run(args []string) int {
 	}
 	switch strings.ToLower(logFormat) {
 	case "vault", "vault_json", "vault-json", "vaultjson", "json", "":
-		c.logger = logformat.NewVaultLoggerWithWriter(c.logGate, level)
+		if devThreeNode {
+			c.logger = logbridge.NewLogger(hclog.New(&hclog.LoggerOptions{
+				Mutex:  &sync.Mutex{},
+				Output: c.logGate,
+			})).LogxiLogger()
+		} else {
+			c.logger = logformat.NewVaultLoggerWithWriter(c.logGate, level)
+		}
 	default:
 		c.logger = log.NewLogger(c.logGate, "vault")
 		c.logger.SetLevel(level)
 	}
 	grpclog.SetLogger(&grpclogFaker{
 		logger: c.logger,
+		log:    os.Getenv("VAULT_GRPC_LOGGING") != "",
 	})
 
 	if os.Getenv("VAULT_DEV_ROOT_TOKEN_ID") != "" && devRootTokenID == "" {
@@ -138,7 +156,7 @@ func (c *ServerCommand) Run(args []string) int {
 		devListenAddress = os.Getenv("VAULT_DEV_LISTEN_ADDRESS")
 	}
 
-	if devHA || devTransactional || devLeasedGeneric || devThreeNode {
+	if devHA || devTransactional || devLeasedKV || devThreeNode {
 		dev = true
 	}
 
@@ -223,6 +241,8 @@ func (c *ServerCommand) Run(args []string) int {
 
 	infoKeys := make([]string, 0, 10)
 	info := make(map[string]string)
+	info["log level"] = logLevel
+	infoKeys = append(infoKeys, "log level")
 
 	var seal vault.Seal = &vault.DefaultSeal{}
 
@@ -237,7 +257,7 @@ func (c *ServerCommand) Run(args []string) int {
 	}()
 
 	if seal == nil {
-		c.Ui.Error(fmt.Sprintf("Could not create seal"))
+		c.Ui.Error(fmt.Sprintf("Could not create seal; most likely proper Seal configuration information was not set, but no error was generated."))
 		return 1
 	}
 
@@ -257,20 +277,29 @@ func (c *ServerCommand) Run(args []string) int {
 		ClusterName:        config.ClusterName,
 		CacheSize:          config.CacheSize,
 		PluginDirectory:    config.PluginDirectory,
+		EnableRaw:          config.EnableRawEndpoint,
 	}
+
 	if dev {
 		coreConfig.DevToken = devRootTokenID
-		if devLeasedGeneric {
-			coreConfig.LogicalBackends["generic"] = vault.LeasedPassthroughBackendFactory
+		if devLeasedKV {
+			coreConfig.LogicalBackends["kv"] = vault.LeasedPassthroughBackendFactory
 		}
 		if devPluginDir != "" {
 			coreConfig.PluginDirectory = devPluginDir
 		}
-
+		if devLatency > 0 {
+			injectLatency := time.Duration(devLatency) * time.Millisecond
+			if _, txnOK := backend.(physical.Transactional); txnOK {
+				coreConfig.Physical = physical.NewTransactionalLatencyInjector(backend, injectLatency, devLatencyJitter, c.logger)
+			} else {
+				coreConfig.Physical = physical.NewLatencyInjector(backend, injectLatency, devLatencyJitter, c.logger)
+			}
+		}
 	}
 
 	if devThreeNode {
-		return c.enableThreeNodeDevCluster(coreConfig, info, infoKeys, devListenAddress)
+		return c.enableThreeNodeDevCluster(coreConfig, info, infoKeys, devListenAddress, os.Getenv("VAULT_DEV_TEMP_DIR"))
 	}
 
 	var disableClustering bool
@@ -318,7 +347,9 @@ func (c *ServerCommand) Run(args []string) int {
 		}
 	}
 
-	if envRA := os.Getenv("VAULT_REDIRECT_ADDR"); envRA != "" {
+	if envRA := os.Getenv("VAULT_API_ADDR"); envRA != "" {
+		coreConfig.RedirectAddr = envRA
+	} else if envRA := os.Getenv("VAULT_REDIRECT_ADDR"); envRA != "" {
 		coreConfig.RedirectAddr = envRA
 	} else if envAA := os.Getenv("VAULT_ADVERTISE_ADDR"); envAA != "" {
 		coreConfig.RedirectAddr = envAA
@@ -416,11 +447,10 @@ CLUSTER_SYNTHESIS_COMPLETE:
 
 	// Compile server information for output later
 	info["storage"] = config.Storage.Type
-	info["log level"] = logLevel
 	info["mlock"] = fmt.Sprintf(
 		"supported: %v, enabled: %v",
 		mlock.Supported(), !config.DisableMlock && mlock.Supported())
-	infoKeys = append(infoKeys, "log level", "mlock", "storage")
+	infoKeys = append(infoKeys, "mlock", "storage")
 
 	if coreConfig.ClusterAddr != "" {
 		info["cluster address"] = coreConfig.ClusterAddr
@@ -451,49 +481,12 @@ CLUSTER_SYNTHESIS_COMPLETE:
 	c.reloadFuncsLock.Lock()
 	lns := make([]net.Listener, 0, len(config.Listeners))
 	for i, lnConfig := range config.Listeners {
-		ln, props, reloadFunc, err := server.NewListener(lnConfig.Type, lnConfig.Config, c.logGate)
+		ln, props, reloadFunc, err := server.NewListener(lnConfig.Type, lnConfig.Config, c.logGate, c.Ui)
 		if err != nil {
 			c.Ui.Output(fmt.Sprintf(
 				"Error initializing listener of type %s: %s",
 				lnConfig.Type, err))
 			return 1
-		}
-
-		if val, ok := lnConfig.Config["proxy_protocol_behavior"]; ok {
-			behavior, ok := val.(string)
-			if !ok {
-				c.Ui.Output(fmt.Sprintf(
-					"Error parsing proxy_protocol_behavior value for listener of type %s: not a string",
-					lnConfig.Type))
-				return 1
-			}
-
-			authorizedAddrsRaw, ok := lnConfig.Config["proxy_protocol_authorized_addrs"]
-			if !ok {
-				c.Ui.Output(fmt.Sprintf(
-					"proxy_protocol_behavior set but no proxy_protocol_authorized_addrs value for listener of type %s",
-					lnConfig.Type))
-				return 1
-			}
-
-			proxyProtoConfig := &proxyutil.ProxyProtoConfig{
-				Behavior: behavior,
-			}
-			if err := proxyProtoConfig.SetAuthorizedAddrs(authorizedAddrsRaw); err != nil {
-				c.Ui.Output(fmt.Sprintf(
-					"Error parsing proxy_protocol_authorized_addrs for listener of type %s: %v",
-					lnConfig.Type, err))
-				return 1
-			}
-
-			newLn, err := proxyutil.WrapInProxyProto(ln, proxyProtoConfig)
-			if err != nil {
-				c.Ui.Output(fmt.Sprintf(
-					"Error configuring PROXY protocol wrapper: %s", err))
-				return 1
-			}
-
-			ln = newLn
 		}
 
 		lns = append(lns, ln)
@@ -593,6 +586,21 @@ CLUSTER_SYNTHESIS_COMPLETE:
 		return 0
 	}
 
+	handler := vaulthttp.Handler(core)
+
+	// This needs to happen before we first unseal, so before we trigger dev
+	// mode if it's set
+	core.SetClusterListenerAddrs(clusterAddrs)
+	core.SetClusterHandler(handler)
+
+	err = core.UnsealWithStoredKeys()
+	if err != nil {
+		if !errwrap.ContainsType(err, new(vault.NonFatalError)) {
+			c.Ui.Output(fmt.Sprintf("Error initializing core: %s", err))
+			return 1
+		}
+	}
+
 	// Perform service discovery registrations and initialization of
 	// HTTP server after the verifyOnly check.
 
@@ -624,15 +632,8 @@ CLUSTER_SYNTHESIS_COMPLETE:
 		}
 	}
 
-	handler := vaulthttp.Handler(core)
-
-	// This needs to happen before we first unseal, so before we trigger dev
-	// mode if it's set
-	core.SetClusterListenerAddrs(clusterAddrs)
-	core.SetClusterHandler(handler)
-
 	// If we're in Dev mode, then initialize the core
-	if dev {
+	if dev && !devSkipInit {
 		init, err := c.enableDev(core, coreConfig)
 		if err != nil {
 			c.Ui.Output(fmt.Sprintf(
@@ -647,31 +648,45 @@ CLUSTER_SYNTHESIS_COMPLETE:
 			quote = ""
 		}
 
+		c.Ui.Output(fmt.Sprint(
+			"==> WARNING: Dev mode is enabled!\n\n" +
+				"In this mode, Vault is completely in-memory and unsealed.\n" +
+				"Vault is configured to only have a single unseal key. The root\n" +
+				"token has already been authenticated with the CLI, so you can\n" +
+				"immediately begin using the Vault CLI.\n\n" +
+				"The only step you need to take is to set the following\n" +
+				"environment variables:\n\n" +
+				"    " + export + " VAULT_ADDR=" + quote + "http://" + config.Listeners[0].Config["address"].(string) + quote + "\n\n" +
+				"The unseal key and root token are reproduced below in case you\n" +
+				"want to seal/unseal the Vault or play with authentication.\n",
+		))
+
+		// Unseal key is not returned if stored shares is supported
+		if len(init.SecretShares) > 0 {
+			c.Ui.Output(fmt.Sprintf(
+				"Unseal Key: %s",
+				base64.StdEncoding.EncodeToString(init.SecretShares[0]),
+			))
+		}
+
+		if len(init.RecoveryShares) > 0 {
+			c.Ui.Output(fmt.Sprintf(
+				"Recovery Key: %s",
+				base64.StdEncoding.EncodeToString(init.RecoveryShares[0]),
+			))
+		}
+
 		c.Ui.Output(fmt.Sprintf(
-			"==> WARNING: Dev mode is enabled!\n\n"+
-				"In this mode, Vault is completely in-memory and unsealed.\n"+
-				"Vault is configured to only have a single unseal key. The root\n"+
-				"token has already been authenticated with the CLI, so you can\n"+
-				"immediately begin using the Vault CLI.\n\n"+
-				"The only step you need to take is to set the following\n"+
-				"environment variables:\n\n"+
-				"    "+export+" VAULT_ADDR="+quote+"http://"+config.Listeners[0].Config["address"].(string)+quote+"\n\n"+
-				"The unseal key and root token are reproduced below in case you\n"+
-				"want to seal/unseal the Vault or play with authentication.\n\n"+
-				"Unseal Key: %s\nRoot Token: %s\n",
-			base64.StdEncoding.EncodeToString(init.SecretShares[0]),
+			"Root Token: %s\n",
 			init.RootToken,
 		))
 	}
 
-	// Initialize the HTTP server
-	server := &http.Server{}
-	if err := http2.ConfigureServer(server, nil); err != nil {
-		c.Ui.Output(fmt.Sprintf("Error configuring server for HTTP/2: %s", err))
-		return 1
-	}
-	server.Handler = handler
+	// Initialize the HTTP servers
 	for _, ln := range lns {
+		server := &http.Server{
+			Handler: handler,
+		}
 		go server.Serve(ln)
 	}
 
@@ -685,6 +700,18 @@ CLUSTER_SYNTHESIS_COMPLETE:
 
 	// Release the log gate.
 	c.logGate.Flush()
+
+	// Write out the PID to the file now that server has successfully started
+	if err := c.storePidFile(config.PidFile); err != nil {
+		c.Ui.Output(fmt.Sprintf("Error storing PID: %v", err))
+		return 1
+	}
+
+	defer func() {
+		if err := c.removePidFile(config.PidFile); err != nil {
+			c.Ui.Output(fmt.Sprintf("Error deleting the PID file: %v", err))
+		}
+	}()
 
 	// Wait for shutdown
 	shutdownTriggered := false
@@ -720,29 +747,51 @@ CLUSTER_SYNTHESIS_COMPLETE:
 }
 
 func (c *ServerCommand) enableDev(core *vault.Core, coreConfig *vault.CoreConfig) (*vault.InitResult, error) {
-	// Initialize it with a basic single key
-	init, err := core.Initialize(&vault.InitParams{
-		BarrierConfig: &vault.SealConfig{
+	var recoveryConfig *vault.SealConfig
+	barrierConfig := &vault.SealConfig{
+		SecretShares:    1,
+		SecretThreshold: 1,
+	}
+
+	if core.SealAccess().RecoveryKeySupported() {
+		recoveryConfig = &vault.SealConfig{
 			SecretShares:    1,
 			SecretThreshold: 1,
-		},
-		RecoveryConfig: nil,
+		}
+	}
+
+	if core.SealAccess().StoredKeysSupported() {
+		barrierConfig.StoredShares = 1
+	}
+
+	// Initialize it with a basic single key
+	init, err := core.Initialize(&vault.InitParams{
+		BarrierConfig:  barrierConfig,
+		RecoveryConfig: recoveryConfig,
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	// Copy the key so that it can be zeroed
-	key := make([]byte, len(init.SecretShares[0]))
-	copy(key, init.SecretShares[0])
+	// Handle unseal with stored keys
+	if core.SealAccess().StoredKeysSupported() {
+		err := core.UnsealWithStoredKeys()
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// Copy the key so that it can be zeroed
+		key := make([]byte, len(init.SecretShares[0]))
+		copy(key, init.SecretShares[0])
 
-	// Unseal the core
-	unsealed, err := core.Unseal(key)
-	if err != nil {
-		return nil, err
-	}
-	if !unsealed {
-		return nil, fmt.Errorf("failed to unseal Vault for dev mode")
+		// Unseal the core
+		unsealed, err := core.Unseal(key)
+		if err != nil {
+			return nil, err
+		}
+		if !unsealed {
+			return nil, fmt.Errorf("failed to unseal Vault for dev mode")
+		}
 	}
 
 	isLeader, _, _, err := core.Leader()
@@ -766,6 +815,7 @@ func (c *ServerCommand) enableDev(core *vault.Core, coreConfig *vault.CoreConfig
 		}
 	}
 
+	// Generate a dev root token if one is provided in the flag
 	if coreConfig.DevToken != "" {
 		req := &logical.Request{
 			ID:          "dev-gen-root",
@@ -813,16 +863,17 @@ func (c *ServerCommand) enableDev(core *vault.Core, coreConfig *vault.CoreConfig
 	return init, nil
 }
 
-func (c *ServerCommand) enableThreeNodeDevCluster(base *vault.CoreConfig, info map[string]string, infoKeys []string, devListenAddress string) int {
+func (c *ServerCommand) enableThreeNodeDevCluster(base *vault.CoreConfig, info map[string]string, infoKeys []string, devListenAddress, tempDir string) int {
 	testCluster := vault.NewTestCluster(&testing.RuntimeT{}, base, &vault.TestClusterOptions{
 		HandlerFunc:       vaulthttp.Handler,
 		BaseListenAddress: devListenAddress,
+		RawLogger:         c.logger,
+		TempDir:           tempDir,
 	})
 	defer c.cleanupGuard.Do(testCluster.Cleanup)
 
 	info["cluster parameters path"] = testCluster.TempDir
-	info["log level"] = "trace"
-	infoKeys = append(infoKeys, "cluster parameters path", "log level")
+	infoKeys = append(infoKeys, "cluster parameters path")
 
 	for i, core := range testCluster.Cores {
 		info[fmt.Sprintf("node %d redirect address", i)] = fmt.Sprintf("https://%s", core.Listeners[0].Address.String())
@@ -1233,9 +1284,55 @@ General Options:
 
   -log-level=info         Log verbosity. Defaults to "info", will be output to
                           stderr. Supported values: "trace", "debug", "info",
-                          "warn", "err"
+                          "warn", "err". Can also be specified with  the
+                          VAULT_LOG_LEVEL environment variable.
 `
 	return strings.TrimSpace(helpText)
+}
+
+func (c *ServerCommand) AutocompleteArgs() complete.Predictor {
+	return complete.PredictNothing
+}
+
+func (c *ServerCommand) AutocompleteFlags() complete.Flags {
+	return complete.Flags{
+		"-config":             complete.PredictOr(complete.PredictFiles("*.hcl"), complete.PredictFiles("*.json")),
+		"-dev":                complete.PredictNothing,
+		"-dev-root-token-id":  complete.PredictNothing,
+		"-dev-listen-address": complete.PredictNothing,
+		"-log-level":          complete.PredictSet("trace", "debug", "info", "warn", "err"),
+	}
+}
+
+// storePidFile is used to write out our PID to a file if necessary
+func (c *ServerCommand) storePidFile(pidPath string) error {
+	// Quit fast if no pidfile
+	if pidPath == "" {
+		return nil
+	}
+
+	// Open the PID file
+	pidFile, err := os.OpenFile(pidPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("could not open pid file: %v", err)
+	}
+	defer pidFile.Close()
+
+	// Write out the PID
+	pid := os.Getpid()
+	_, err = pidFile.WriteString(fmt.Sprintf("%d", pid))
+	if err != nil {
+		return fmt.Errorf("could not write to pid file: %v", err)
+	}
+	return nil
+}
+
+// removePidFile is used to cleanup the PID file if necessary
+func (c *ServerCommand) removePidFile(pidPath string) error {
+	if pidPath == "" {
+		return nil
+	}
+	return os.Remove(pidPath)
 }
 
 // MakeShutdownCh returns a channel that can be used for shutdown
@@ -1272,6 +1369,7 @@ func MakeSighupCh() chan struct{} {
 
 type grpclogFaker struct {
 	logger log.Logger
+	log    bool
 }
 
 func (g *grpclogFaker) Fatal(args ...interface{}) {
@@ -1290,13 +1388,19 @@ func (g *grpclogFaker) Fatalln(args ...interface{}) {
 }
 
 func (g *grpclogFaker) Print(args ...interface{}) {
-	g.logger.Warn(fmt.Sprint(args...))
+	if g.log && g.logger.IsTrace() {
+		g.logger.Trace(fmt.Sprint(args...))
+	}
 }
 
 func (g *grpclogFaker) Printf(format string, args ...interface{}) {
-	g.logger.Warn(fmt.Sprintf(format, args...))
+	if g.log && g.logger.IsTrace() {
+		g.logger.Trace(fmt.Sprintf(format, args...))
+	}
 }
 
 func (g *grpclogFaker) Println(args ...interface{}) {
-	g.logger.Warn(fmt.Sprintln(args...))
+	if g.log && g.logger.IsTrace() {
+		g.logger.Trace(fmt.Sprintln(args...))
+	}
 }

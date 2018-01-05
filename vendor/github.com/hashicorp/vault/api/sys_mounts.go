@@ -124,6 +124,8 @@ type MountInput struct {
 	Description string           `json:"description" structs:"description"`
 	Config      MountConfigInput `json:"config" structs:"config"`
 	Local       bool             `json:"local" structs:"local"`
+	PluginName  string           `json:"plugin_name,omitempty" structs:"plugin_name"`
+	SealWrap    bool             `json:"seal_wrap" structs:"seal_wrap" mapstructure:"seal_wrap"`
 }
 
 type MountConfigInput struct {
@@ -139,6 +141,7 @@ type MountOutput struct {
 	Accessor    string            `json:"accessor" structs:"accessor"`
 	Config      MountConfigOutput `json:"config" structs:"config"`
 	Local       bool              `json:"local" structs:"local"`
+	SealWrap    bool              `json:"seal_wrap" structs:"seal_wrap" mapstructure:"seal_wrap"`
 }
 
 type MountConfigOutput struct {

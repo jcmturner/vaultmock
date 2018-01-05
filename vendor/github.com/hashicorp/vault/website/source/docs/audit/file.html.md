@@ -56,7 +56,7 @@ Following are the configuration options available for the backend.
         <span class="param">file_path</span>
         <span class="param-flags">required</span>
             The path to where the audit log will be written. If this
-            path exists, the audit backend will append to it.
+            path exists, the audit backend will append to it. Specify `"stdout"` to write audit log to standard output; specify `"discard"` to discard output (useful in testing scenarios).
       </li>
       <li>
         <span class="param">log_raw</span>
@@ -77,7 +77,7 @@ Following are the configuration options available for the backend.
         <span class="param-flags">optional</span>
             A string containing an octal number representing the bit pattern
             for the file mode, similar to `chmod`. This option defaults to
-            `0600`.
+            `0600`. Specifying mode of `0000` will disable Vault's setting any mode on the file.
       </li>
       <li>
         <span class="param">format</span>

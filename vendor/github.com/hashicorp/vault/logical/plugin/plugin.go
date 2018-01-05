@@ -5,6 +5,7 @@ import (
 	"crypto/rsa"
 	"encoding/gob"
 	"fmt"
+	"time"
 
 	"sync"
 
@@ -14,11 +15,26 @@ import (
 	log "github.com/mgutz/logxi/v1"
 )
 
-// Register these types since we have to serialize and de-serialize tls.ConnectionState
-// over the wire as part of logical.Request.Connection.
+// init registers basic structs with gob which will be used to transport complex
+// types through the plugin server and client.
 func init() {
+	// Common basic structs
+	gob.Register([]interface{}{})
+	gob.Register(map[string]interface{}{})
+	gob.Register(map[string]string{})
+	gob.Register(map[string]int{})
+
+	// Register these types since we have to serialize and de-serialize
+	// tls.ConnectionState over the wire as part of logical.Request.Connection.
 	gob.Register(rsa.PublicKey{})
 	gob.Register(ecdsa.PublicKey{})
+	gob.Register(time.Duration(0))
+
+	// Custom common error types for requests. If you add something here, you must
+	// also add it to the switch statement in `wrapError`!
+	gob.Register(&plugin.BasicError{})
+	gob.Register(logical.CodedError(0, ""))
+	gob.Register(&logical.StatusBadRequest{})
 }
 
 // BackendPluginClient is a wrapper around backendPluginClient
@@ -40,8 +56,9 @@ func (b *BackendPluginClient) Cleanup() {
 
 // NewBackend will return an instance of an RPC-based client implementation of the backend for
 // external plugins, or a concrete implementation of the backend if it is a builtin backend.
-// The backend is returned as a logical.Backend interface.
-func NewBackend(pluginName string, sys pluginutil.LookRunnerUtil, logger log.Logger) (logical.Backend, error) {
+// The backend is returned as a logical.Backend interface. The isMetadataMode param determines whether
+// the plugin should run in metadata mode.
+func NewBackend(pluginName string, sys pluginutil.LookRunnerUtil, logger log.Logger, isMetadataMode bool) (logical.Backend, error) {
 	// Look for plugin in the plugin catalog
 	pluginRunner, err := sys.LookupPlugin(pluginName)
 	if err != nil {
@@ -65,7 +82,7 @@ func NewBackend(pluginName string, sys pluginutil.LookRunnerUtil, logger log.Log
 
 	} else {
 		// create a backendPluginClient instance
-		backend, err = newPluginClient(sys, pluginRunner, logger)
+		backend, err = newPluginClient(sys, pluginRunner, logger, isMetadataMode)
 		if err != nil {
 			return nil, err
 		}
@@ -74,12 +91,21 @@ func NewBackend(pluginName string, sys pluginutil.LookRunnerUtil, logger log.Log
 	return backend, nil
 }
 
-func newPluginClient(sys pluginutil.RunnerUtil, pluginRunner *pluginutil.PluginRunner, logger log.Logger) (logical.Backend, error) {
+func newPluginClient(sys pluginutil.RunnerUtil, pluginRunner *pluginutil.PluginRunner, logger log.Logger, isMetadataMode bool) (logical.Backend, error) {
 	// pluginMap is the map of plugins we can dispense.
 	pluginMap := map[string]plugin.Plugin{
-		"backend": &BackendPlugin{},
+		"backend": &BackendPlugin{
+			metadataMode: isMetadataMode,
+		},
 	}
-	client, err := pluginRunner.Run(sys, pluginMap, handshakeConfig, []string{}, logger)
+
+	var client *plugin.Client
+	var err error
+	if isMetadataMode {
+		client, err = pluginRunner.RunMetadataMode(sys, pluginMap, handshakeConfig, []string{}, logger)
+	} else {
+		client, err = pluginRunner.Run(sys, pluginMap, handshakeConfig, []string{}, logger)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -104,4 +130,23 @@ func newPluginClient(sys pluginutil.RunnerUtil, pluginRunner *pluginutil.PluginR
 		client:              client,
 		backendPluginClient: backendRPC,
 	}, nil
+}
+
+// wrapError takes a generic error type and makes it usable with the plugin
+// interface. Only errors which have exported fields and have been registered
+// with gob can be unwrapped and transported. This checks error types and, if
+// none match, wrap the error in a plugin.BasicError.
+func wrapError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	switch err.(type) {
+	case *plugin.BasicError,
+		logical.HTTPCodedError,
+		*logical.StatusBadRequest:
+		return err
+	}
+
+	return plugin.NewBasicError(err)
 }

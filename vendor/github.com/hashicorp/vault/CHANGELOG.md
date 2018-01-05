@@ -1,23 +1,388 @@
-## 0.8.2 (Unreleased)
+## 0.9.2 (Unreleased)
 
-DEPRECATIONS:
+IMPROVEMENTS:
+
+ * physical/s3: Allow using paths with S3 for non-AWS deployments [GH-3730]
+ * physical/s3: Add ability to disable SSL for non-AWS deployments [GH-3730]
+
+## 0.9.1 (December 21st, 2017)
+
+DEPRECATIONS/CHANGES:
+
+ * AppRole Case Sensitivity: In prior versions of Vault, `list` operations
+   against AppRole roles would require preserving case in the role name, even
+   though most other operations within AppRole are case-insensitive with
+   respect to the role name. This has been fixed; existing roles will behave as
+   they have in the past, but new roles will act case-insensitively in these
+   cases.
+ * Token Auth Backend Roles parameter types: For `allowed_policies` and
+   `disallowed_policies` in role definitions in the token auth backend, input
+   can now be a comma-separated string or an array of strings. Reading a role
+   will now return arrays for these parameters.
+ * Transit key exporting: You can now mark a key in the `transit` backend as
+   `exportable` at any time, rather than just at creation time; however, once
+   this value is set, it still cannot be unset.
+ * PKI Secret Backend Roles parameter types: For `allowed_domains` and
+   `key_usage` in role definitions in the PKI secret backend, input
+   can now be a comma-separated string or an array of strings. Reading a role
+   will now return arrays for these parameters.
+ * SSH Dynamic Keys Method Defaults to 2048-bit Keys: When using the dynamic
+   key method in the SSH backend, the default is now to use 2048-bit keys if no
+   specific key bit size is specified.
+ * Consul Secret Backend lease handling: The `consul` secret backend can now
+   accept both strings and integer numbers of seconds for its lease value. The
+   value returned on a role read will be an integer number of seconds instead
+   of a human-friendly string.
+ * Unprintable characters not allowed in API paths: Unprintable characters are
+   no longer allowed in names in the API (paths and path parameters), with an
+   extra restriction on whitespace characters. Allowed characters are those
+   that are considered printable by Unicode plus spaces.
+
+FEATURES:
+
+ * **Transit Backup/Restore**: The `transit` backend now supports a backup
+   operation that can export a given key, including all key versions and
+   configuration, as well as a restore operation allowing import into another
+   Vault.
+ * **gRPC Database Plugins**: Database plugins now use gRPC for transport,
+   allowing them to be written in other languages.
+ * **Nomad Secret Backend**: Nomad ACL tokens can now be generated and revoked
+   using Vault.
+ * **TLS Cert Auth Backend Improvements**: The `cert` auth backend can now
+   match against custom certificate extensions via exact or glob matching, and
+   additionally supports max_ttl and periodic token toggles.
+
+IMPROVEMENTS:
+
+ * auth/cert: Support custom certificate constraints [GH-3634]
+ * auth/cert: Support setting `max_ttl` and `period` [GH-3642]
+ * audit/file: Setting a file mode of `0000` will now disable Vault from
+   automatically `chmod`ing the log file [GH-3649]
+ * auth/github: The legacy MFA system can now be used with the GitHub auth
+   backend [GH-3696]
+ * auth/okta: The legacy MFA system can now be used with the Okta auth backend
+   [GH-3653]
+ * auth/token: `allowed_policies` and `disallowed_policies` can now be specified
+   as a comma-separated string or an array of strings [GH-3641]
+ * command/server: The log level can now be specified with `VAULT_LOG_LEVEL`
+   [GH-3721]
+ * core: Period values from auth backends will now be checked and applied to the
+   TTL value directly by core on login and renewal requests [GH-3677]
+ * database/mongodb: Add optional `write_concern` parameter, which can be set
+   during database configuration. This establishes a session-wide [write
+   concern](https://docs.mongodb.com/manual/reference/write-concern/) for the
+   lifecycle of the mount [GH-3646]
+ * http: Request path containing non-printable characters will return 400 - Bad
+   Request [GH-3697]
+ * mfa/okta: Filter a given email address as a login filter, allowing operation
+   when login email and account email are different
+ * plugins: Make Vault more resilient when unsealing when plugins are
+   unavailable [GH-3686]
+ * secret/pki: `allowed_domains` and `key_usage` can now be specified
+   as a comma-separated string or an array of strings [GH-3642]
+ * secret/ssh: Allow 4096-bit keys to be used in dynamic key method [GH-3593]
+ * secret/consul: The Consul secret backend now uses the value of `lease` set
+   on the role, if set, when renewing a secret. [GH-3796]
+ * storage/mysql: Don't attempt database creation if it exists, which can help
+   under certain permissions constraints [GH-3716]
+
+BUG FIXES:
+
+ * api/status (enterprise): Fix status reporting when using an auto seal
+ * auth/approle: Fix case-sensitive/insensitive comparison issue [GH-3665]
+ * auth/cert: Return `allowed_names` on role read [GH-3654]
+ * auth/ldap: Fix incorrect control information being sent [GH-3402] [GH-3496]
+   [GH-3625] [GH-3656]
+ * core: Fix seal status reporting when using an autoseal
+ * core: Add creation path to wrap info for a control group token
+ * core: Fix potential panic that could occur using plugins when a node
+   transitioned from active to standby [GH-3638]
+ * core: Fix memory ballooning when a connection would connect to the cluster
+   port and then go away -- redux! [GH-3680]
+ * core: Replace recursive token revocation logic with depth-first logic, which
+   can avoid hitting stack depth limits in extreme cases [GH-2348]
+ * core: When doing a read on configured audited-headers, properly handle case
+   insensitivity [GH-3701]
+ * core/pkcs11 (enterprise): Fix panic when PKCS#11 library is not readable
+ * database/mysql: Allow the creation statement to use commands that are not yet
+   supported by the prepare statement protocol [GH-3619]
+ * plugin/auth-gcp: Fix IAM roles when using `allow_gce_inference` [VPAG-19]
+
+## 0.9.0.1 (November 21st, 2017) (Enterprise Only)
+
+IMPROVEMENTS:
+
+ * auth/gcp: Support seal wrapping of configuration parameters
+ * auth/kubernetes: Support seal wrapping of configuration parameters
+
+BUG FIXES:
+
+ * Fix an upgrade issue with some physical backends when migrating from legacy
+   HSM stored key support to the new Seal Wrap mechanism
+
+## 0.9.0 (November 14th, 2017)
+
+DEPRECATIONS/CHANGES:
+
+ * HSM config parameter requirements: When using Vault with an HSM, a new
+   paramter is required: `hmac_key_label`.  This performs a similar function to
+   `key_label` but for the HMAC key Vault will use. Vault will generate a
+   suitable key if this value is specified and `generate_key` is set true.
+ * API HTTP client behavior: When calling `NewClient` the API no longer
+   modifies the provided client/transport. In particular this means it will no
+   longer enable redirection limiting and HTTP/2 support on custom clients. It
+   is suggested that if you want to make changes to an HTTP client that you use
+   one created by `DefaultConfig` as a starting point.
+ * AWS EC2 client nonce behavior: The client nonce generated by the backend
+   that gets returned along with the authentication response will be audited in
+   plaintext. If this is undesired, the clients can choose to supply a custom
+   nonce to the login endpoint. The custom nonce set by the client will from
+   now on, not be returned back with the authentication response, and hence not
+   audit logged.
+ * AWS Auth role options: The API will now error when trying to create or
+   update a role with the mutually-exclusive options
+   `disallow_reauthentication` and `allow_instance_migration`.
+ * SSH CA role read changes: When reading back a role from the `ssh` backend,
+   the TTL/max TTL values will now be an integer number of seconds rather than
+   a string. This better matches the API elsewhere in Vault.
+ * SSH role list changes: When listing roles from the `ssh` backend via the API,
+   the response data will additionally return a `key_info` map that will contain
+   a map of each key with a corresponding object containing the `key_type`.
+ * More granularity in audit logs: Audit request and response entires are still
+   in RFC3339 format but now have a granularity of nanoseconds.
+ * High availability related values have been moved out of the `storage` and
+   `ha_storage` stanzas, and into the top-level configuration. `redirect_addr`
+   has been renamed to `api_addr`. The stanzas still support accepting
+   HA-related values to maintain backward compatibility, but top-level values
+   will take precedence.
+ * A new `seal` stanza has been added to the configuration file, which is
+   optional and enables configuration of the seal type to use for additional
+   data protection, such as using HSM or Cloud KMS solutions to encrypt and
+   decrypt data.
+ 
+FEATURES:
+
+ * **RSA Support for Transit Backend**: Transit backend can now generate RSA
+   keys which can be used for encryption and signing. [GH-3489]
+ * **Identity System**: Now in open source and with significant enhancements,
+   Identity is an integrated system for understanding users across tokens and
+   enabling easier management of users directly and via groups.
+ * **External Groups in Identity**: Vault can now automatically assign users
+   and systems to groups in Identity based on their membership in external
+   groups.
+ * **Seal Wrap / FIPS 140-2 Compatibility (Enterprise)**: Vault can now take
+   advantage of FIPS 140-2-certified HSMs to ensure that Critical Security
+   Parameters are protected in a compliant fashion. Vault's implementation has
+   received a statement of compliance from Leidos.
+ * **Control Groups (Enterprise)**: Require multiple members of an Identity
+   group to authorize a requested action before it is allowed to run.
+ * **Cloud Auto-Unseal (Enterprise)**: Automatically unseal Vault using AWS KMS
+   and GCP CKMS.
+ * **Sentinel Integration (Enterprise)**: Take advantage of HashiCorp Sentinel
+   to create extremely flexible access control policies -- even on
+   unauthenticated endpoints.
+ * **Barrier Rekey Support for Auto-Unseal (Enterprise)**: When using auto-unsealing
+   functionality, the `rekey` operation is now supported; it uses recovery keys
+   to authorize the master key rekey.
+ * **Operation Token for Disaster Recovery Actions (Enterprise)**: When using
+   Disaster Recovery replication, a token can be created that can be used to
+   authorize actions such as promotion and updating primary information, rather
+   than using recovery keys.
+ * **Trigger Auto-Unseal with Recovery Keys (Enterprise)**: When using
+   auto-unsealing, a request to unseal Vault can be triggered by a threshold of
+   recovery keys, rather than requiring the Vault process to be restarted.
+ * **UI Redesign (Enterprise)**: All new experience for the Vault Enterprise
+   UI. The look and feel has been completely redesigned to give users a better
+   experience and make managing secrets fast and easy.
+ * **UI: SSH Secret Backend (Enterprise)**: Configure an SSH secret backend,
+   create and browse roles. And use them to sign keys or generate one time
+   passwords.
+ * **UI: AWS Secret Backend (Enterprise)**: You can now configure the AWS
+   backend via the Vault Enterprise UI. In addition you can create roles,
+   browse the roles and Generate IAM Credentials from them in the UI.
+
+IMPROVEMENTS:
+
+ * api: Add ability to set custom headers on each call [GH-3394]
+ * command/server: Add config option to disable requesting client certificates
+   [GH-3373]
+ * core: Disallow mounting underneath an existing path, not just over [GH-2919]
+ * physical/file: Use `700` as permissions when creating directories. The files
+   themselves were `600` and are all encrypted, but this doesn't hurt.
+ * secret/aws: Add ability to use custom IAM/STS endpoints [GH-3416]
+ * secret/cassandra: Work around Cassandra ignoring consistency levels for a
+   user listing query [GH-3469]
+ * secret/pki: Private keys can now be marshalled as PKCS#8 [GH-3518]
+ * secret/pki: Allow entering URLs for `pki` as both comma-separated strings and JSON
+   arrays [GH-3409]
+ * secret/ssh: Role TTL/max TTL can now be specified as either a string or an
+   integer [GH-3507]
+ * secret/transit: Sign and verify operations now support a `none` hash
+   algorithm to allow signing/verifying pre-hashed data [GH-3448]
+ * secret/database: Add the ability to glob allowed roles in the Database Backend [GH-3387]
+ * ui (enterprise): Support for RSA keys in the transit backend
+ * ui (enterprise): Support for DR Operation Token generation, promoting, and
+   updating primary on DR Secondary clusters
+
+BUG FIXES:
+
+ * api: Fix panic when setting a custom HTTP client but with a nil transport
+   [GH-3435] [GH-3437]
+ * api: Fix authing to the `cert` backend when the CA for the client cert is
+   not known to the server's listener [GH-2946]
+ * auth/approle: Create role ID index during read if a role is missing one [GH-3561]
+ * auth/aws: Don't allow mutually exclusive options [GH-3291]
+ * auth/radius: Fix logging in in some situations [GH-3461]
+ * core: Fix memleak when a connection would connect to the cluster port and
+   then go away [GH-3513]
+ * core: Fix panic if a single-use token is used to step-down or seal [GH-3497]
+ * core: Set rather than add headers to prevent some duplicated headers in
+   responses when requests were forwarded to the active node [GH-3485]
+ * physical/etcd3: Fix some listing issues due to how etcd3 does prefix
+   matching [GH-3406]
+ * physical/etcd3: Fix case where standbys can lose their etcd client lease
+   [GH-3031]
+ * physical/file: Fix listing when underscores are the first component of a
+   path [GH-3476]
+ * plugins: Allow response errors to be returned from backend plugins [GH-3412]
+ * secret/transit: Fix panic if the length of the input ciphertext was less
+   than the expected nonce length [GH-3521]
+ * ui (enterprise): Reinstate support for generic secret backends - this was
+   erroneously removed in a previous release
+
+## 0.8.3 (September 19th, 2017)
+
+CHANGES:
+
+ * Policy input/output standardization: For all built-in authentication
+   backends, policies can now be specified as a comma-delimited string or an
+   array if using JSON as API input; on read, policies will be returned as an
+   array; and the `default` policy will not be forcefully added to policies
+   saved in configurations. Please note that the `default` policy will continue
+   to be added to generated tokens, however, rather than backends adding
+   `default` to the given set of input policies (in some cases, and not in
+   others), the stored set will reflect the user-specified set.
+ * `sign-self-issued` modifies Issuer in generated certificates: In 0.8.2 the
+   endpoint would not modify the Issuer in the generated certificate, leaving
+   the output self-issued. Although theoretically valid, in practice crypto
+   stacks were unhappy validating paths containing such certs. As a result,
+   `sign-self-issued` now encodes the signing CA's Subject DN into the Issuer
+   DN of the generated certificate.
+ * `sys/raw` requires enabling: While the `sys/raw` endpoint can be extremely
+   useful in break-glass or support scenarios, it is also extremely dangerous.
+   As of now, a configuration file option `raw_storage_endpoint` must be set in
+   order to enable this API endpoint. Once set, the available functionality has
+   been enhanced slightly; it now supports listing and decrypting most of
+   Vault's core data structures, except for the encryption keyring itself.
+ * `generic` is now `kv`: To better reflect its actual use, the `generic`
+   backend is now `kv`. Using `generic` will still work for backwards
+   compatibility.
+
+FEATURES:
+
+ * **GCE Support for GCP Auth**: GCE instances can now authenticate to Vault
+   using machine credentials.
+ * **Support for Kubernetes Service Account Auth**: Kubernetes Service Accounts
+   can now authenticate to vault using JWT tokens.
+
+IMPROVEMENTS:
+
+ * configuration: Provide a config option to store Vault server's process ID
+   (PID) in a file [GH-3321]
+ * mfa (Enterprise): Add the ability to use identity metadata in username format
+ * mfa/okta (Enterprise): Add support for configuring base_url for API calls
+ * secret/pki: `sign-intermediate` will now allow specifying a `ttl` value 
+   longer than the signing CA certificate's NotAfter value. [GH-3325]
+ * sys/raw: Raw storage access is now disabled by default [GH-3329]
+
+BUG FIXES:
+
+ * auth/okta: Fix regression that removed the ability to set base_url [GH-3313]
+ * core: Fix panic while loading leases at startup on ARM processors 
+   [GH-3314]
+ * secret/pki: Fix `sign-self-issued` encoding the wrong subject public key
+   [GH-3325]
+
+## 0.8.2.1 (September 11th, 2017) (Enterprise Only)
+
+BUG FIXES:
+
+ * Fix an issue upgrading to 0.8.2 for Enterprise customers.
+
+## 0.8.2 (September 5th, 2017)
+
+SECURITY:
+
+* In prior versions of Vault, if authenticating via AWS IAM and requesting a
+  periodic token, the period was not properly respected. This could lead to
+  tokens expiring unexpectedly, or a token lifetime being longer than expected.
+  Upon token renewal with Vault 0.8.2 the period will be properly enforced.
+
+DEPRECATIONS/CHANGES:
 
 * `vault ssh` users should supply `-mode` and `-role` to reduce the number of
   API calls. A future version of Vault will mark these optional values are
   required. Failure to supply `-mode` or `-role` will result in a warning.
+* Vault plugins will first briefly run a restricted version of the plugin to
+  fetch metadata, and then lazy-load the plugin on first request to prevent
+  crash/deadlock of Vault during the unseal process. Plugins will need to be
+  built with the latest changes in order for them to run properly.
 
 FEATURES:
 
+* **Lazy Lease Loading**: On startup, Vault will now load leases from storage
+  in a lazy fashion (token checks and revocation/renewal requests still force
+  an immediate load). For larger installations this can significantly reduce
+  downtime when switching active nodes or bringing Vault up from cold start.
 * **SSH CA Login with `vault ssh`**: `vault ssh` now supports the SSH CA
   backend for authenticating to machines. It also supports remote host key
   verification through the SSH CA backend, if enabled.
+* **Signing of Self-Issued Certs in PKI**: The `pki` backend now supports
+  signing self-issued CA certs. This is useful when switching root CAs.
+
+IMPROVEMENTS:
+
+ * audit/file: Allow specifying `stdout` as the `file_path` to log to standard
+   output [GH-3235]
+ * auth/aws: Allow wildcards in `bound_iam_principal_arn` [GH-3213]
+ * auth/okta: Compare groups case-insensitively since Okta is only
+   case-preserving [GH-3240]
+ * auth/okta: Standardize Okta configuration APIs across backends [GH-3245]
+ * cli: Add subcommand autocompletion that can be enabled with 
+   `vault -autocomplete-install` [GH-3223]
+ * cli: Add ability to handle wrapped responses when using `vault auth`. What
+   is output depends on the other given flags; see the help output for that
+   command for more information. [GH-3263]
+ * core: TLS cipher suites used for cluster behavior can now be set via
+   `cluster_cipher_suites` in configuration [GH-3228]
+ * core: The `plugin_name` can now either be specified directly as part of the
+   parameter or within the `config` object when mounting a secret or auth backend
+   via `sys/mounts/:path` or `sys/auth/:path` respectively [GH-3202]
+ * core: It is now possible to update the `description` of a mount when
+   mount-tuning, although this must be done through the HTTP layer [GH-3285]
+ * secret/databases/mongo: If an EOF is encountered, attempt reconnecting and
+   retrying the operation [GH-3269]
+ * secret/pki: TTLs can now be specified as a string or an integer number of
+   seconds [GH-3270]
+ * secret/pki: Self-issued certs can now be signed via
+   `pki/root/sign-self-issued` [GH-3274]
+ * storage/gcp: Use application default credentials if they exist [GH-3248]
 
 BUG FIXES:
 
- * core: Policy-related commands would sometimes fail to act case-insensitively
-   [GH-3210]
  * auth/aws: Properly use role-set period values for IAM-derived token renewals
    [GH-3220]
+ * auth/okta: Fix updating organization/ttl/max_ttl after initial setting
+   [GH-3236]
+ * core: Fix PROXY when underlying connection is TLS [GH-3195]
+ * core: Policy-related commands would sometimes fail to act case-insensitively
+   [GH-3210]
+ * storage/consul: Fix parsing TLS configuration when using a bare IPv6 address
+   [GH-3268]
+ * plugins: Lazy-load plugins to prevent crash/deadlock during unseal process.
+   [GH-3255]
+ * plugins: Skip mounting plugin-based secret and credential mounts when setting
+   up mounts if the plugin is no longer present in the catalog. [GH-3255]
 
 ## 0.8.1 (August 16th, 2017)
 
@@ -307,9 +672,9 @@ FEATURES:
    Lambda instances, and more. Signed client identity information retrieved
    using the AWS API `sts:GetCallerIdentity` is validated against the AWS STS
    service before issuing a Vault token. This backend is unified with the
-   `aws-ec2` authentication backend, and allows additional EC2-related
-   restrictions to be applied during the IAM authentication; the previous EC2
-   behavior is also still available. [GH-2441]
+   `aws-ec2` authentication backend under the name `aws`, and allows additional
+   EC2-related restrictions to be applied during the IAM authentication; the
+   previous EC2 behavior is also still available. [GH-2441]
  * **MSSQL Physical Backend**: You can now use Microsoft SQL Server as your
    Vault physical data store [GH-2546]
  * **Lease Listing and Lookup**: You can now introspect a lease to get its

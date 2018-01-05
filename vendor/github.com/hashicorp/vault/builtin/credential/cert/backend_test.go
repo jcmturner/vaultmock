@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"math/big"
 	"net"
@@ -44,10 +45,10 @@ const (
 // But the client, presents the CA cert of the server to trust the server.
 // The client can present a cert and key which is completely independent of server's CA.
 // The connection state returned will contain the certificate presented by the client.
-func connectionState(t *testing.T, serverCAPath, serverCertPath, serverKeyPath, clientCertPath, clientKeyPath string) tls.ConnectionState {
+func connectionState(serverCAPath, serverCertPath, serverKeyPath, clientCertPath, clientKeyPath string) (tls.ConnectionState, error) {
 	serverKeyPair, err := tls.LoadX509KeyPair(serverCertPath, serverKeyPath)
 	if err != nil {
-		t.Fatal(err)
+		return tls.ConnectionState{}, err
 	}
 	// Prepare the listener configuration with server's key pair
 	listenConf := &tls.Config{
@@ -57,7 +58,7 @@ func connectionState(t *testing.T, serverCAPath, serverCertPath, serverKeyPath, 
 
 	clientKeyPair, err := tls.LoadX509KeyPair(clientCertPath, clientKeyPath)
 	if err != nil {
-		t.Fatal(err)
+		return tls.ConnectionState{}, err
 	}
 	// Load the CA cert required by the client to authenticate the server.
 	rootConfig := &rootcerts.Config{
@@ -65,7 +66,7 @@ func connectionState(t *testing.T, serverCAPath, serverCertPath, serverKeyPath, 
 	}
 	serverCAs, err := rootcerts.LoadCACerts(rootConfig)
 	if err != nil {
-		t.Fatal(err)
+		return tls.ConnectionState{}, err
 	}
 	// Prepare the dial configuration that the client uses to establish the connection.
 	dialConf := &tls.Config{
@@ -76,37 +77,68 @@ func connectionState(t *testing.T, serverCAPath, serverCertPath, serverKeyPath, 
 	// Start the server.
 	list, err := tls.Listen("tcp", "127.0.0.1:0", listenConf)
 	if err != nil {
-		t.Fatal(err)
+		return tls.ConnectionState{}, err
 	}
 	defer list.Close()
 
+	// Accept connections.
+	serverErrors := make(chan error, 1)
+	connState := make(chan tls.ConnectionState)
+	go func() {
+		defer close(connState)
+		serverConn, err := list.Accept()
+		if err != nil {
+			serverErrors <- err
+			close(serverErrors)
+			return
+		}
+		defer serverConn.Close()
+
+		// Read the ping
+		buf := make([]byte, 4)
+		_, err = serverConn.Read(buf)
+		if (err != nil) && (err != io.EOF) {
+			serverErrors <- err
+			close(serverErrors)
+			return
+		}
+		close(serverErrors)
+		connState <- serverConn.(*tls.Conn).ConnectionState()
+	}()
+
 	// Establish a connection from the client side and write a few bytes.
+	clientErrors := make(chan error, 1)
 	go func() {
 		addr := list.Addr().String()
 		conn, err := tls.Dial("tcp", addr, dialConf)
 		if err != nil {
-			t.Fatalf("err: %v", err)
+			clientErrors <- err
+			close(clientErrors)
+			return
 		}
 		defer conn.Close()
 
 		// Write ping
-		conn.Write([]byte("ping"))
+		_, err = conn.Write([]byte("ping"))
+		if err != nil {
+			clientErrors <- err
+		}
+		close(clientErrors)
 	}()
 
-	// Accept the connection on the server side.
-	serverConn, err := list.Accept()
-	if err != nil {
-		t.Fatal(err)
+	for err = range clientErrors {
+		if err != nil {
+			return tls.ConnectionState{}, fmt.Errorf("error in client goroutine:%v", err)
+		}
 	}
-	defer serverConn.Close()
 
-	// Read the ping
-	buf := make([]byte, 4)
-	serverConn.Read(buf)
-
+	for err = range serverErrors {
+		if err != nil {
+			return tls.ConnectionState{}, fmt.Errorf("error in server goroutine:%v", err)
+		}
+	}
 	// Grab the current state
-	connState := serverConn.(*tls.Conn).ConnectionState()
-	return connState
+	return <-connState, nil
 }
 
 func TestBackend_NonCAExpiry(t *testing.T) {
@@ -298,7 +330,10 @@ func TestBackend_NonCAExpiry(t *testing.T) {
 	}
 
 	// Create connection state using the certificates generated
-	connState := connectionState(t, caCertFile.Name(), caCertFile.Name(), caKeyFile.Name(), issuedCertFile.Name(), issuedKeyFile.Name())
+	connState, err := connectionState(caCertFile.Name(), caCertFile.Name(), caKeyFile.Name(), issuedCertFile.Name(), issuedKeyFile.Name())
+	if err != nil {
+		t.Fatalf("error testing connection state:%v", err)
+	}
 
 	loginReq := &logical.Request{
 		Operation: logical.UpdateOperation,
@@ -361,7 +396,10 @@ func TestBackend_RegisteredNonCA_CRL(t *testing.T) {
 
 	// Connection state is presenting the client Non-CA cert and its key.
 	// This is exactly what is registered at the backend.
-	connState := connectionState(t, serverCAPath, serverCertPath, serverKeyPath, testCertPath1, testKeyPath1)
+	connState, err := connectionState(serverCAPath, serverCertPath, serverKeyPath, testCertPath1, testKeyPath1)
+	if err != nil {
+		t.Fatalf("error testing connection state:%v", err)
+	}
 	loginReq := &logical.Request{
 		Operation: logical.UpdateOperation,
 		Storage:   storage,
@@ -441,7 +479,10 @@ func TestBackend_CRLs(t *testing.T) {
 
 	// Connection state is presenting the client CA cert and its key.
 	// This is exactly what is registered at the backend.
-	connState := connectionState(t, serverCAPath, serverCertPath, serverKeyPath, testRootCACertPath1, testRootCAKeyPath1)
+	connState, err := connectionState(serverCAPath, serverCertPath, serverKeyPath, testRootCACertPath1, testRootCAKeyPath1)
+	if err != nil {
+		t.Fatalf("error testing connection state:%v", err)
+	}
 	loginReq := &logical.Request{
 		Operation: logical.UpdateOperation,
 		Storage:   storage,
@@ -457,7 +498,10 @@ func TestBackend_CRLs(t *testing.T) {
 
 	// Now, without changing the registered client CA cert, present from
 	// the client side, a cert issued using the registered CA.
-	connState = connectionState(t, serverCAPath, serverCertPath, serverKeyPath, testCertPath1, testKeyPath1)
+	connState, err = connectionState(serverCAPath, serverCertPath, serverKeyPath, testCertPath1, testKeyPath1)
+	if err != nil {
+		t.Fatalf("error testing connection state: %v", err)
+	}
 	loginReq.Connection.ConnState = &connState
 
 	// Attempt login with the updated connection
@@ -507,7 +551,10 @@ func TestBackend_CRLs(t *testing.T) {
 	}
 
 	// Test login using a different client CA cert pair.
-	connState = connectionState(t, serverCAPath, serverCertPath, serverKeyPath, testRootCACertPath2, testRootCAKeyPath2)
+	connState, err = connectionState(serverCAPath, serverCertPath, serverKeyPath, testRootCACertPath2, testRootCAKeyPath2)
+	if err != nil {
+		t.Fatalf("error testing connection state: %v", err)
+	}
 	loginReq.Connection.ConnState = &connState
 
 	// Attempt login with the updated connection
@@ -540,7 +587,7 @@ func TestBackend_CRLs(t *testing.T) {
 func testFactory(t *testing.T) logical.Backend {
 	b, err := Factory(&logical.BackendConfig{
 		System: &logical.StaticSystemView{
-			DefaultLeaseTTLVal: 300 * time.Second,
+			DefaultLeaseTTLVal: 1000 * time.Second,
 			MaxLeaseTTLVal:     1800 * time.Second,
 		},
 		StorageView: &logical.InmemStorage{},
@@ -572,9 +619,9 @@ func TestBackend_CertWrites(t *testing.T) {
 	tc := logicaltest.TestCase{
 		Backend: testFactory(t),
 		Steps: []logicaltest.TestStep{
-			testAccStepCert(t, "aaa", ca1, "foo", "", false),
-			testAccStepCert(t, "bbb", ca2, "foo", "", false),
-			testAccStepCert(t, "ccc", ca3, "foo", "", true),
+			testAccStepCert(t, "aaa", ca1, "foo", "", "", false),
+			testAccStepCert(t, "bbb", ca2, "foo", "", "", false),
+			testAccStepCert(t, "ccc", ca3, "foo", "", "", true),
 		},
 	}
 	tc.Steps = append(tc.Steps, testAccStepListCerts(t, []string{"aaa", "bbb"})...)
@@ -583,8 +630,11 @@ func TestBackend_CertWrites(t *testing.T) {
 
 // Test a client trusted by a CA
 func TestBackend_basic_CA(t *testing.T) {
-	connState := testConnState(t, "test-fixtures/keys/cert.pem",
+	connState, err := testConnState("test-fixtures/keys/cert.pem",
 		"test-fixtures/keys/key.pem", "test-fixtures/root/rootcacert.pem")
+	if err != nil {
+		t.Fatalf("error testing connection state: %v", err)
+	}
 	ca, err := ioutil.ReadFile("test-fixtures/root/rootcacert.pem")
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -592,16 +642,18 @@ func TestBackend_basic_CA(t *testing.T) {
 	logicaltest.Test(t, logicaltest.TestCase{
 		Backend: testFactory(t),
 		Steps: []logicaltest.TestStep{
-			testAccStepCert(t, "web", ca, "foo", "", false),
+			testAccStepCert(t, "web", ca, "foo", "", "", false),
 			testAccStepLogin(t, connState),
 			testAccStepCertLease(t, "web", ca, "foo"),
 			testAccStepCertTTL(t, "web", ca, "foo"),
 			testAccStepLogin(t, connState),
+			testAccStepCertMaxTTL(t, "web", ca, "foo"),
+			testAccStepLogin(t, connState),
 			testAccStepCertNoLease(t, "web", ca, "foo"),
 			testAccStepLoginDefaultLease(t, connState),
-			testAccStepCert(t, "web", ca, "foo", "*.example.com", false),
+			testAccStepCert(t, "web", ca, "foo", "*.example.com", "", false),
 			testAccStepLogin(t, connState),
-			testAccStepCert(t, "web", ca, "foo", "*.invalid.com", false),
+			testAccStepCert(t, "web", ca, "foo", "*.invalid.com", "", false),
 			testAccStepLoginInvalid(t, connState),
 		},
 	})
@@ -609,8 +661,11 @@ func TestBackend_basic_CA(t *testing.T) {
 
 // Test CRL behavior
 func TestBackend_Basic_CRLs(t *testing.T) {
-	connState := testConnState(t, "test-fixtures/keys/cert.pem",
+	connState, err := testConnState("test-fixtures/keys/cert.pem",
 		"test-fixtures/keys/key.pem", "test-fixtures/root/rootcacert.pem")
+	if err != nil {
+		t.Fatalf("error testing connection state: %v", err)
+	}
 	ca, err := ioutil.ReadFile("test-fixtures/root/rootcacert.pem")
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -635,8 +690,11 @@ func TestBackend_Basic_CRLs(t *testing.T) {
 
 // Test a self-signed client (root CA) that is trusted
 func TestBackend_basic_singleCert(t *testing.T) {
-	connState := testConnState(t, "test-fixtures/root/rootcacert.pem",
+	connState, err := testConnState("test-fixtures/root/rootcacert.pem",
 		"test-fixtures/root/rootcakey.pem", "test-fixtures/root/rootcacert.pem")
+	if err != nil {
+		t.Fatalf("error testing connection state: %v", err)
+	}
 	ca, err := ioutil.ReadFile("test-fixtures/root/rootcacert.pem")
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -644,11 +702,68 @@ func TestBackend_basic_singleCert(t *testing.T) {
 	logicaltest.Test(t, logicaltest.TestCase{
 		Backend: testFactory(t),
 		Steps: []logicaltest.TestStep{
-			testAccStepCert(t, "web", ca, "foo", "", false),
+			testAccStepCert(t, "web", ca, "foo", "", "", false),
 			testAccStepLogin(t, connState),
-			testAccStepCert(t, "web", ca, "foo", "example.com", false),
+			testAccStepCert(t, "web", ca, "foo", "example.com", "", false),
 			testAccStepLogin(t, connState),
-			testAccStepCert(t, "web", ca, "foo", "invalid", false),
+			testAccStepCert(t, "web", ca, "foo", "invalid", "", false),
+			testAccStepLoginInvalid(t, connState),
+			testAccStepCert(t, "web", ca, "foo", "", "1.2.3.4:invalid", false),
+			testAccStepLoginInvalid(t, connState),
+		},
+	})
+}
+
+// Test a self-signed client with custom extensions (root CA) that is trusted
+func TestBackend_extensions_singleCert(t *testing.T) {
+	connState, err := testConnState(
+		"test-fixtures/root/rootcawextcert.pem",
+		"test-fixtures/root/rootcawextkey.pem",
+		"test-fixtures/root/rootcacert.pem",
+	)
+	if err != nil {
+		t.Fatalf("error testing connection state: %v", err)
+	}
+	ca, err := ioutil.ReadFile("test-fixtures/root/rootcacert.pem")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	logicaltest.Test(t, logicaltest.TestCase{
+		Backend: testFactory(t),
+		Steps: []logicaltest.TestStep{
+			testAccStepCert(t, "web", ca, "foo", "", "2.1.1.1:A UTF8String Extension", false),
+			testAccStepLogin(t, connState),
+			testAccStepCert(t, "web", ca, "foo", "", "2.1.1.1:*,2.1.1.2:A UTF8*", false),
+			testAccStepLogin(t, connState),
+			testAccStepCert(t, "web", ca, "foo", "", "1.2.3.45:*", false),
+			testAccStepLoginInvalid(t, connState),
+			testAccStepCert(t, "web", ca, "foo", "", "2.1.1.1:The Wrong Value", false),
+			testAccStepLoginInvalid(t, connState),
+			testAccStepCert(t, "web", ca, "foo", "", "2.1.1.1:*,2.1.1.2:The Wrong Value", false),
+			testAccStepLoginInvalid(t, connState),
+			testAccStepCert(t, "web", ca, "foo", "", "2.1.1.1:", false),
+			testAccStepLoginInvalid(t, connState),
+			testAccStepCert(t, "web", ca, "foo", "", "2.1.1.1:,2.1.1.2:*", false),
+			testAccStepLoginInvalid(t, connState),
+			testAccStepCert(t, "web", ca, "foo", "example.com", "2.1.1.1:A UTF8String Extension", false),
+			testAccStepLogin(t, connState),
+			testAccStepCert(t, "web", ca, "foo", "example.com", "2.1.1.1:*,2.1.1.2:A UTF8*", false),
+			testAccStepLogin(t, connState),
+			testAccStepCert(t, "web", ca, "foo", "example.com", "1.2.3.45:*", false),
+			testAccStepLoginInvalid(t, connState),
+			testAccStepCert(t, "web", ca, "foo", "example.com", "2.1.1.1:The Wrong Value", false),
+			testAccStepLoginInvalid(t, connState),
+			testAccStepCert(t, "web", ca, "foo", "example.com", "2.1.1.1:*,2.1.1.2:The Wrong Value", false),
+			testAccStepLoginInvalid(t, connState),
+			testAccStepCert(t, "web", ca, "foo", "invalid", "2.1.1.1:A UTF8String Extension", false),
+			testAccStepLoginInvalid(t, connState),
+			testAccStepCert(t, "web", ca, "foo", "invalid", "2.1.1.1:*,2.1.1.2:A UTF8*", false),
+			testAccStepLoginInvalid(t, connState),
+			testAccStepCert(t, "web", ca, "foo", "invalid", "1.2.3.45:*", false),
+			testAccStepLoginInvalid(t, connState),
+			testAccStepCert(t, "web", ca, "foo", "invalid", "2.1.1.1:The Wrong Value", false),
+			testAccStepLoginInvalid(t, connState),
+			testAccStepCert(t, "web", ca, "foo", "invalid", "2.1.1.1:*,2.1.1.2:The Wrong Value", false),
 			testAccStepLoginInvalid(t, connState),
 		},
 	})
@@ -656,8 +771,11 @@ func TestBackend_basic_singleCert(t *testing.T) {
 
 // Test against a collection of matching and non-matching rules
 func TestBackend_mixed_constraints(t *testing.T) {
-	connState := testConnState(t, "test-fixtures/keys/cert.pem",
+	connState, err := testConnState("test-fixtures/keys/cert.pem",
 		"test-fixtures/keys/key.pem", "test-fixtures/root/rootcacert.pem")
+	if err != nil {
+		t.Fatalf("error testing connection state: %v", err)
+	}
 	ca, err := ioutil.ReadFile("test-fixtures/root/rootcacert.pem")
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -665,9 +783,9 @@ func TestBackend_mixed_constraints(t *testing.T) {
 	logicaltest.Test(t, logicaltest.TestCase{
 		Backend: testFactory(t),
 		Steps: []logicaltest.TestStep{
-			testAccStepCert(t, "1unconstrained", ca, "foo", "", false),
-			testAccStepCert(t, "2matching", ca, "foo", "*.example.com,whatever", false),
-			testAccStepCert(t, "3invalid", ca, "foo", "invalid", false),
+			testAccStepCert(t, "1unconstrained", ca, "foo", "", "", false),
+			testAccStepCert(t, "2matching", ca, "foo", "*.example.com,whatever", "", false),
+			testAccStepCert(t, "3invalid", ca, "foo", "invalid", "", false),
 			testAccStepLogin(t, connState),
 			// Assumes CertEntries are processed in alphabetical order (due to store.List), so we only match 2matching if 1unconstrained doesn't match
 			testAccStepLoginWithName(t, connState, "2matching"),
@@ -678,8 +796,11 @@ func TestBackend_mixed_constraints(t *testing.T) {
 
 // Test an untrusted client
 func TestBackend_untrusted(t *testing.T) {
-	connState := testConnState(t, "test-fixtures/keys/cert.pem",
+	connState, err := testConnState("test-fixtures/keys/cert.pem",
 		"test-fixtures/keys/key.pem", "test-fixtures/root/rootcacert.pem")
+	if err != nil {
+		t.Fatalf("error testing connection state: %v", err)
+	}
 	logicaltest.Test(t, logicaltest.TestCase{
 		Backend: testFactory(t),
 		Steps: []logicaltest.TestStep{
@@ -764,7 +885,7 @@ func testAccStepLoginDefaultLease(t *testing.T, connState tls.ConnectionState) l
 		Unauthenticated: true,
 		ConnState:       &connState,
 		Check: func(resp *logical.Response) error {
-			if resp.Auth.TTL != 300*time.Second {
+			if resp.Auth.TTL != 1000*time.Second {
 				t.Fatalf("bad lease length: %#v", resp.Auth)
 			}
 
@@ -844,17 +965,18 @@ func testAccStepListCerts(
 }
 
 func testAccStepCert(
-	t *testing.T, name string, cert []byte, policies string, allowedNames string, expectError bool) logicaltest.TestStep {
+	t *testing.T, name string, cert []byte, policies string, allowedNames string, requiredExtensions string, expectError bool) logicaltest.TestStep {
 	return logicaltest.TestStep{
 		Operation: logical.UpdateOperation,
 		Path:      "certs/" + name,
 		ErrorOk:   expectError,
 		Data: map[string]interface{}{
-			"certificate":   string(cert),
-			"policies":      policies,
-			"display_name":  name,
-			"allowed_names": allowedNames,
-			"lease":         1000,
+			"certificate":         string(cert),
+			"policies":            policies,
+			"display_name":        name,
+			"allowed_names":       allowedNames,
+			"required_extensions": requiredExtensions,
+			"lease":               1000,
 		},
 		Check: func(resp *logical.Response) error {
 			if resp == nil && expectError {
@@ -893,6 +1015,21 @@ func testAccStepCertTTL(
 	}
 }
 
+func testAccStepCertMaxTTL(
+	t *testing.T, name string, cert []byte, policies string) logicaltest.TestStep {
+	return logicaltest.TestStep{
+		Operation: logical.UpdateOperation,
+		Path:      "certs/" + name,
+		Data: map[string]interface{}{
+			"certificate":  string(cert),
+			"policies":     policies,
+			"display_name": name,
+			"ttl":          "1000s",
+			"max_ttl":      "1200s",
+		},
+	}
+}
+
 func testAccStepCertNoLease(
 	t *testing.T, name string, cert []byte, policies string) logicaltest.TestStep {
 	return logicaltest.TestStep{
@@ -906,17 +1043,17 @@ func testAccStepCertNoLease(
 	}
 }
 
-func testConnState(t *testing.T, certPath, keyPath, rootCertPath string) tls.ConnectionState {
+func testConnState(certPath, keyPath, rootCertPath string) (tls.ConnectionState, error) {
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
-		t.Fatalf("err: %v", err)
+		return tls.ConnectionState{}, err
 	}
 	rootConfig := &rootcerts.Config{
 		CAFile: rootCertPath,
 	}
 	rootCAs, err := rootcerts.LoadCACerts(rootConfig)
 	if err != nil {
-		t.Fatalf("err: %v", err)
+		return tls.ConnectionState{}, err
 	}
 	listenConf := &tls.Config{
 		Certificates:       []tls.Certificate{cert},
@@ -926,37 +1063,72 @@ func testConnState(t *testing.T, certPath, keyPath, rootCertPath string) tls.Con
 	}
 	dialConf := new(tls.Config)
 	*dialConf = *listenConf
+	// start a server
 	list, err := tls.Listen("tcp", "127.0.0.1:0", listenConf)
 	if err != nil {
-		t.Fatalf("err: %v", err)
+		return tls.ConnectionState{}, err
 	}
 	defer list.Close()
 
+	// Accept connections.
+	serverErrors := make(chan error, 1)
+	connState := make(chan tls.ConnectionState)
+	go func() {
+		defer close(connState)
+		serverConn, err := list.Accept()
+		serverErrors <- err
+		if err != nil {
+			close(serverErrors)
+			return
+		}
+		defer serverConn.Close()
+
+		// Read the ping
+		buf := make([]byte, 4)
+		_, err = serverConn.Read(buf)
+		if (err != nil) && (err != io.EOF) {
+			serverErrors <- err
+			close(serverErrors)
+			return
+		} else {
+			// EOF is a reasonable error condition, so swallow it.
+			serverErrors <- nil
+		}
+		close(serverErrors)
+		connState <- serverConn.(*tls.Conn).ConnectionState()
+	}()
+
+	// Establish a connection from the client side and write a few bytes.
+	clientErrors := make(chan error, 1)
 	go func() {
 		addr := list.Addr().String()
 		conn, err := tls.Dial("tcp", addr, dialConf)
+		clientErrors <- err
 		if err != nil {
-			t.Fatalf("err: %v", err)
+			close(clientErrors)
+			return
 		}
 		defer conn.Close()
 
 		// Write ping
-		conn.Write([]byte("ping"))
+		_, err = conn.Write([]byte("ping"))
+		clientErrors <- err
+		close(clientErrors)
 	}()
 
-	serverConn, err := list.Accept()
-	if err != nil {
-		t.Fatalf("err: %v", err)
+	for err = range clientErrors {
+		if err != nil {
+			return tls.ConnectionState{}, fmt.Errorf("error in client goroutine:%v", err)
+		}
 	}
-	defer serverConn.Close()
 
-	// Read the pign
-	buf := make([]byte, 4)
-	serverConn.Read(buf)
-
+	for err = range serverErrors {
+		if err != nil {
+			return tls.ConnectionState{}, fmt.Errorf("error in server goroutine:%v", err)
+		}
+	}
 	// Grab the current state
-	connState := serverConn.(*tls.Conn).ConnectionState()
-	return connState
+	return <-connState, nil
 }
 
 func Test_Renew(t *testing.T) {
@@ -974,8 +1146,11 @@ func Test_Renew(t *testing.T) {
 	}
 
 	b := lb.(*backend)
-	connState := testConnState(t, "test-fixtures/keys/cert.pem",
+	connState, err := testConnState("test-fixtures/keys/cert.pem",
 		"test-fixtures/keys/key.pem", "test-fixtures/root/rootcacert.pem")
+	if err != nil {
+		t.Fatalf("error testing connection state: %v", err)
+	}
 	ca, err := ioutil.ReadFile("test-fixtures/root/rootcacert.pem")
 	if err != nil {
 		t.Fatal(err)

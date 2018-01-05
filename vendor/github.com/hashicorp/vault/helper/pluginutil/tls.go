@@ -29,6 +29,10 @@ var (
 	// PluginCACertPEMEnv is an ENV name used for holding a CA PEM-encoded
 	// string. Used for testing.
 	PluginCACertPEMEnv = "VAULT_TESTING_PLUGIN_CA_PEM"
+
+	// PluginMetadaModeEnv is an ENV name used to disable TLS communication
+	// to bootstrap mounting plugins.
+	PluginMetadaModeEnv = "VAULT_PLUGIN_METADATA_MODE"
 )
 
 // generateCert is used internally to create certificates for the plugin
@@ -124,6 +128,10 @@ func wrapServerConfig(sys RunnerUtil, certBytes []byte, key *ecdsa.PrivateKey) (
 // VaultPluginTLSProvider is run inside a plugin and retrives the response
 // wrapped TLS certificate from vault. It returns a configured TLS Config.
 func VaultPluginTLSProvider(apiTLSConfig *api.TLSConfig) func() (*tls.Config, error) {
+	if os.Getenv(PluginMetadaModeEnv) == "true" {
+		return nil
+	}
+
 	return func() (*tls.Config, error) {
 		unwrapToken := os.Getenv(PluginUnwrapTokenEnv)
 
@@ -138,26 +146,29 @@ func VaultPluginTLSProvider(apiTLSConfig *api.TLSConfig) func() (*tls.Config, er
 
 		addrRaw := wt.Claims().Get("addr")
 		if addrRaw == nil {
-			return nil, errors.New("decoded token does not contain primary cluster address")
+			return nil, errors.New("decoded token does not contain the active node's api_addr")
 		}
 		vaultAddr, ok := addrRaw.(string)
 		if !ok {
-			return nil, errors.New("decoded token's address not valid")
+			return nil, errors.New("decoded token's api_addr not valid")
 		}
 		if vaultAddr == "" {
-			return nil, errors.New(`no address for the vault found`)
+			return nil, errors.New(`no vault api_addr found`)
 		}
 
 		// Sanity check the value
 		if _, err := url.Parse(vaultAddr); err != nil {
-			return nil, fmt.Errorf("error parsing the vault address: %s", err)
+			return nil, fmt.Errorf("error parsing the vault api_addr: %s", err)
 		}
 
 		// Unwrap the token
 		clientConf := api.DefaultConfig()
 		clientConf.Address = vaultAddr
 		if apiTLSConfig != nil {
-			clientConf.ConfigureTLS(apiTLSConfig)
+			err := clientConf.ConfigureTLS(apiTLSConfig)
+			if err != nil {
+				return nil, errwrap.Wrapf("error configuring api client {{err}}", err)
+			}
 		}
 		client, err := api.NewClient(clientConf)
 		if err != nil {

@@ -7,10 +7,11 @@ import (
 	"time"
 
 	"github.com/hashicorp/vault/helper/reload"
+	"github.com/mitchellh/cli"
 )
 
-func tcpListenerFactory(config map[string]interface{}, _ io.Writer) (net.Listener, map[string]string, reload.ReloadFunc, error) {
-	bind_proto := "tcp"
+func tcpListenerFactory(config map[string]interface{}, _ io.Writer, ui cli.Ui) (net.Listener, map[string]string, reload.ReloadFunc, error) {
+	bindProto := "tcp"
 	var addr string
 	addrRaw, ok := config["address"]
 	if !ok {
@@ -22,17 +23,23 @@ func tcpListenerFactory(config map[string]interface{}, _ io.Writer) (net.Listene
 	// If they've passed 0.0.0.0, we only want to bind on IPv4
 	// rather than golang's dual stack default
 	if strings.HasPrefix(addr, "0.0.0.0:") {
-		bind_proto = "tcp4"
+		bindProto = "tcp4"
 	}
 
-	ln, err := net.Listen(bind_proto, addr)
+	ln, err := net.Listen(bindProto, addr)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
 	ln = tcpKeepAliveListener{ln.(*net.TCPListener)}
+
+	ln, err = listenerWrapProxy(ln, config)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
 	props := map[string]string{"addr": addr}
-	return listenerWrapTLS(ln, props, config)
+	return listenerWrapTLS(ln, props, config, ui)
 }
 
 // tcpKeepAliveListener sets TCP keep-alive timeouts on accepted

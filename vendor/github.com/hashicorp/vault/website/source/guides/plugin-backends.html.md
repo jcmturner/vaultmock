@@ -59,7 +59,7 @@ and use that to register the plugin into Vault's plugin catalog.
 $ shasum -a 256 /etc/vault/vault_plugins/mock-plugin
 2c071aafa1b30897e60b79643e77592cb9d1e8f803025d44a7f9bbfa4779d615  /etc/vault/vault_plugins/mock-plugin
 
-$ vault sys/plugins/catalog/mock-plugin sha_256=2c071aafa1b30897e60b79643e77592cb9d1e8f803025d44a7f9bbfa4779d615 command=mock-plugin
+$ vault write sys/plugins/catalog/mock-plugin sha_256=2c071aafa1b30897e60b79643e77592cb9d1e8f803025d44a7f9bbfa4779d615 command=mock-plugin
 Success! Data written to: sys/plugins/catalog/mock-plugin
 ```
 
@@ -73,7 +73,7 @@ $ vault mounts
 Path        Type       Accessor            Plugin       Default TTL  Max TTL  Force No Cache  Replication Behavior  Description
 cubbyhole/  cubbyhole  cubbyhole_80ef4e30  n/a          n/a          n/a      false           local                 per-token private secret storage
 mock/       plugin     plugin_10fc2cce     mock-plugin  system       system   false           replicated
-secret/     generic    generic_ef2a14ec    n/a          system       system   false           replicated            generic secret storage
+secret/     kv         kv_ef2a14ec         n/a          system       system   false           replicated            key/value secret storage
 sys/        system     system_e3a4cccd     n/a          n/a          n/a      false           replicated            system endpoints used for control, policy and debugging
 ```
 
@@ -95,7 +95,7 @@ Successfully unmounted 'mock' if it was mounted
 $ vault mounts
 Path        Type       Accessor            Plugin  Default TTL  Max TTL  Force No Cache  Replication Behavior  Description
 cubbyhole/  cubbyhole  cubbyhole_80ef4e30  n/a     n/a          n/a      false           local                 per-token private secret storage
-secret/     generic    generic_ef2a14ec    n/a     system       system   false           replicated            generic secret storage
+secret/     kv         kv_ef2a14ec         n/a     system       system   false           replicated            key/value secret storage
 sys/        system     system_e3a4cccd     n/a     n/a          n/a      false           replicated            system endpoints used for control, policy and debugging
 ```
 
