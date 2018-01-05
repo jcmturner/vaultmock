@@ -189,5 +189,6 @@ func handleAuthResult(mc *mysqlConn, oldCipher []byte) error {
 }
 
 func init() {
-	sql.Register("mysql", &MySQLDriver{})
+	// Commented out to avoid "panic: sql: Register called twice for driver mysql"
+	//sql.Register("mysql", &MySQLDriver{})
 }
