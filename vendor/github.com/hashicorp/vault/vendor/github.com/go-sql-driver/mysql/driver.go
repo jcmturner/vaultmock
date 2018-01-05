@@ -17,7 +17,7 @@
 package mysql
 
 import (
-	"database/sql"
+	//"database/sql"
 	"database/sql/driver"
 	"net"
 )
